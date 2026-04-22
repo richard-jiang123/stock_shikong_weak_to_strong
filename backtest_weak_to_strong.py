@@ -106,23 +106,25 @@ def detect_weak_to_strong_signals(df, consolidation, wave_info):
         if i >= n: break
         pct = df.iloc[i]['pct_chg']
         signal_type = None
-        if i > 0 and pct > CONFIG['weak_strong_threshold']:
-            if df.iloc[i-1]['close'] < df.iloc[i-1]['open']:
-                signal_type = 'big_bullish_reversal'
-        if i > 0 and pct > 0.02:
-            if df.iloc[i-1]['close'] < df.iloc[i-1]['open'] and df.iloc[i]['close'] > df.iloc[i-1]['open']:
-                signal_type = 'bullish_engulfing'
-        if i > 0:
-            prev_pct = df.iloc[i-1]['pct_chg']
-            prev_high = df.iloc[i-1]['high']
-            prev_close = df.iloc[i-1]['close']
-            if prev_pct > 0.08 and prev_close < prev_high * 0.97 and pct > 0.02:
-                signal_type = 'limit_up_open_next_strong'
+        # 按优先级检测，一旦命中就不再覆盖
+        # 优先级: 异动不跌 > 阳包阴 > 大阳反转 > 烂板次日
         if i > 1:
             prev_amp = df.iloc[i-1]['amplitude'] if 'amplitude' in df.columns else \
                        (df.iloc[i-1]['high'] - df.iloc[i-1]['low']) / df.iloc[i-1]['close']
             if prev_amp > CONFIG['anomaly_amplitude'] and pct > 0.01:
                 signal_type = 'anomaly_no_decline'
+        if signal_type is None and i > 0 and pct > 0.02:
+            if df.iloc[i-1]['close'] < df.iloc[i-1]['open'] and df.iloc[i]['close'] > df.iloc[i-1]['open']:
+                signal_type = 'bullish_engulfing'
+        if signal_type is None and i > 0 and pct > CONFIG['weak_strong_threshold']:
+            if df.iloc[i-1]['close'] < df.iloc[i-1]['open']:
+                signal_type = 'big_bullish_reversal'
+        if signal_type is None and i > 0:
+            prev_pct = df.iloc[i-1]['pct_chg']
+            prev_high = df.iloc[i-1]['high']
+            prev_close = df.iloc[i-1]['close']
+            if prev_pct > 0.08 and prev_close < prev_high * 0.97 and pct > 0.02:
+                signal_type = 'limit_up_open_next_strong'
         if signal_type:
             signals.append({
                 'idx': i, 'date': df.iloc[i]['date'], 'type': signal_type,

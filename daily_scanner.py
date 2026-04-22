@@ -23,6 +23,7 @@ CONFIG = {
 def detect_pattern(df):
     n = len(df)
     if n < 20: return None
+    # === 阶段1: 检测一波上涨 ===
     waves = []
     i = 0
     while i < n - CONFIG['first_wave_min_days']:
@@ -37,6 +38,7 @@ def detect_pattern(df):
     if not waves: return None
     ws, we, wg, wd = waves[-1]
     if we >= n - 5: return None
+    # === 阶段2: 检测温和回调 ===
     peak = df.iloc[we]['close']; cs = we + 1
     mn, mi, days = peak, cs, 0
     for k in range(cs, min(n, cs + CONFIG['consolidation_max_days'])):
@@ -46,15 +48,22 @@ def detect_pattern(df):
     if dd > CONFIG['consolidation_max_drawdown']: return None
     dn = sum(1 for k in range(cs, mi+1) if k < n and df.iloc[k]['pct_chg'] < 0)
     if days < 3 or dn/max(days,1) >= 0.7: return None
+    # === 阶段3: 检测反转信号 (必须是最新一个交易日) ===
     ti = n - 1; tp = df.iloc[ti]['pct_chg']
     se = mi; ss = cs
     if ti < max(se, ss+2) or ti > max(se, ss+2) + 10: return None
+    # 按优先级检测信号，一旦命中就不再覆盖
     sig = None
-    if tp > CONFIG['weak_strong_threshold'] and df.iloc[ti-1]['close'] < df.iloc[ti-1]['open']: sig = '大阳反转'
-    if tp > 0.02 and df.iloc[ti-1]['close'] < df.iloc[ti-1]['open'] and df.iloc[ti]['close'] > df.iloc[ti-1]['open']: sig = '阳包阴'
-    if df.iloc[ti-1]['amplitude'] > CONFIG['anomaly_amplitude'] and tp > 0.01: sig = '异动不跌'
-    if df.iloc[ti-1]['pct_chg'] > 0.08 and df.iloc[ti-1]['close'] < df.iloc[ti-1]['high']*0.97 and tp > 0.02: sig = '烂板次日'
+    if df.iloc[ti-1]['amplitude'] > CONFIG['anomaly_amplitude'] and tp > 0.01:
+        sig = '异动不跌'
+    elif tp > 0.02 and df.iloc[ti-1]['close'] < df.iloc[ti-1]['open'] and df.iloc[ti]['close'] > df.iloc[ti-1]['open']:
+        sig = '阳包阴'
+    elif tp > CONFIG['weak_strong_threshold'] and df.iloc[ti-1]['close'] < df.iloc[ti-1]['open']:
+        sig = '大阳反转'
+    elif df.iloc[ti-1]['pct_chg'] > 0.08 and df.iloc[ti-1]['close'] < df.iloc[ti-1]['high']*0.97 and tp > 0.02:
+        sig = '烂板次日'
     if not sig: return None
+    # === 评分 ===
     sc = 5; reasons = []
     if wg > 0.30: sc += 20; reasons.append(f"一波{wg*100:.0f}%")
     elif wg > 0.20: sc += 10; reasons.append(f"一波{wg*100:.0f}%")
@@ -69,9 +78,12 @@ def detect_pattern(df):
     if df.iloc[ti]['ma5'] > df.iloc[ti]['ma10'] > df.iloc[ti]['ma20']: sc += 10; reasons.append("多头")
     elif df.iloc[ti]['ma5'] > df.iloc[ti]['ma10']: sc += 5
     if sig == '异动不跌': sc += 10
+    # 止损价 = 回调阶段最低价(mn) × 0.98
+    # mn 是回调期间所有 K 线的 low 字段的最小值，即盘中实际触及的最低价格
+    # ×0.98 表示留 2% 安全边际，避免盘中波动误触发
     return {'sig': sig, 'score': sc, 'reasons': ' | '.join(reasons),
             'wg': wg, 'dd': dd, 'tp': tp, 'vr': vr,
-            'sl': mn*0.98, 'ep': df.iloc[ti]['close']}
+            'sl': mn*0.98, 'ep': df.iloc[ti]['close'], 'cons_low': mn}
 
 def main():
     print("="*70)
