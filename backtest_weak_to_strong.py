@@ -167,10 +167,13 @@ def simulate_trade(df, signal_idx, signal):
             'max_profit': (peak_since_entry - entry_price) / entry_price, 'max_drawdown': 0}
 
 # ==================== 回测主流程 ====================
-def run_backtest(dl, codes, start_date, end_date, max_stocks=200):
-    random.seed(42)
-    selected_codes = random.sample(codes, min(max_stocks, len(codes)))
-    print(f"\n随机选取 {len(selected_codes)} 只股票进行回测")
+def run_backtest(dl, codes, start_date, end_date, max_stocks=None):
+    if max_stocks:
+        random.seed(42)
+        selected_codes = random.sample(codes, min(max_stocks, len(codes)))
+    else:
+        selected_codes = codes
+    print(f"\n使用 {len(selected_codes)} 只股票进行回测")
     print(f"回测区间: {start_date} 至 {end_date}")
 
     all_trades = []
@@ -334,7 +337,7 @@ if __name__ == '__main__':
     start_str = start_dt.strftime('%Y-%m-%d')
     end_str = end_dt.strftime('%Y-%m-%d')
 
-    trades = run_backtest(dl, codes, start_str, end_str, max_stocks=200)
+    trades = run_backtest(dl, codes, start_str, end_str)
 
     if trades:
         results_df = analyze_results(trades)
