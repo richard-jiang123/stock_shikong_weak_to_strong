@@ -115,6 +115,10 @@ def main():
     for i, code in enumerate(codes):
         if code not in kline_cache:
             continue
+        # 剔除ST股
+        name = name_map.get(code, '')
+        if 'ST' in name.upper():
+            continue
         df = kline_cache[code]
         r = detect_pattern(df)
         if r:

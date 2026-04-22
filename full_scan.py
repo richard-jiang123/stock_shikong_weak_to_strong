@@ -121,6 +121,9 @@ def main():
     for i, code in enumerate(codes):
         df = dl.get_kline(code, start_full, today)
         if df is None: continue
+        # 剔除ST股
+        if 'ST' in name_map.get(code, '').upper():
+            continue
         r = detect_pattern(df)
         if r:
             last = df.iloc[-1]
