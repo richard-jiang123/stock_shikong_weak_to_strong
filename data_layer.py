@@ -99,9 +99,25 @@ class StockDataLayer:
             ''')
 
     def update_stock_list(self):
-        """更新股票列表"""
-        rs = bs.query_all_stock(day=datetime.now().strftime('%Y-%m-%d'))
-        df = rs.get_data()
+        """更新股票列表，失败时回退到本地缓存"""
+        for attempt in range(3):
+            try:
+                rs = bs.query_all_stock(day=datetime.now().strftime('%Y-%m-%d'))
+                df = rs.get_data()
+                if df is not None and 'code' in df.columns:
+                    break
+            except Exception:
+                pass
+            import time; time.sleep(2)
+        else:
+            # API 失败，使用本地缓存
+            with self._get_conn() as conn:
+                df = pd.read_sql("SELECT code, name FROM stock_meta", conn)
+            if not df.empty:
+                print(f"  API不可用，使用本地缓存: {len(df)} 只")
+                return df
+            raise RuntimeError("无法获取股票列表，API和本地缓存均不可用")
+
         mask = df['code'].str.match(r'^(sh\.60|sz\.00|sz\.30)\d{4}$')
         df = df[mask].copy()
 
@@ -114,6 +130,48 @@ class StockDataLayer:
                 )
         print(f"  股票列表已更新: {len(df)} 只")
         return df
+
+    def is_all_updated(self, target_date=None):
+        """
+        检查是否所有股票的数据都已更新到目标日期。
+        先看 stock_daily 全局最大日期，如果已经是目标日期就跳过。
+        如果还没到目标日期，采样检查 5 只股票确认是否真的没有新数据。
+        返回 (is_ready, max_date, sample_checked)。
+        """
+        if target_date is None:
+            target_date = datetime.now().strftime('%Y-%m-%d')
+        with self._get_conn() as conn:
+            cur = conn.execute("SELECT MAX(date) FROM stock_daily")
+            max_date = cur.fetchone()[0]
+            if max_date is None:
+                return False, None, 0
+            # 如果最大日期 >= 目标日期，说明数据已最新
+            if max_date >= target_date:
+                return True, max_date, 0
+            # 还没到目标日期，但可能是非交易日。采样检查5只活跃股票。
+            cur = conn.execute(
+                "SELECT code FROM stock_daily WHERE date=? LIMIT 5", (max_date,))
+            sample = [r[0] for r in cur.fetchall()]
+        if len(sample) < 2:
+            return False, max_date, 0
+
+        import baostock as bs
+        bs.login()
+        has_today = False
+        for code in sample:
+            rs = bs.query_history_k_data_plus(code, "date",
+                start_date=target_date, end_date=target_date, frequency="d")
+            if rs.get_data() is not None and len(rs.get_data()) > 0:
+                has_today = True
+                break
+        bs.logout()
+
+        if has_today:
+            # 今天确实是交易日，需要增量更新
+            return False, max_date, len(sample)
+        else:
+            # 今天是非交易日，数据已最新
+            return True, max_date, len(sample)
 
     def get_last_date(self, code):
         """获取某股票最后一条数据的日期"""
