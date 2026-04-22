@@ -106,6 +106,11 @@ def main():
     print(f"  成功加载 {len(kline_cache)}/{len(codes)} 只股票数据")
     sys.stdout.flush()
 
+    # 加载股票名称映射
+    with dl._get_conn() as conn:
+        name_df = pd.read_sql("SELECT code, name FROM stock_meta", conn)
+    name_map = dict(zip(name_df['code'], name_df['name']))
+
     results = []
     for i, code in enumerate(codes):
         if code not in kline_cache:
@@ -115,7 +120,8 @@ def main():
         if r:
             last = df.iloc[-1]
             results.append({
-                'code': code.split('.')[1], 'close': last['close'],
+                'code': code.split('.')[1], 'name': name_map.get(code, ''),
+                'close': last['close'],
                 'pct_chg': last['pct_chg'], 'signal': r['sig'],
                 'score': r['score'], 'wave_gain': r['wg'],
                 'cons_dd': r['dd'], 'vol_ratio': r['vr'],
