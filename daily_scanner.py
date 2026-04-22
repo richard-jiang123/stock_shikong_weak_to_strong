@@ -93,16 +93,24 @@ def main():
     sys.stdout.flush()
 
     # 2. 本地扫描
-    print(f"\n[2/2] 本地扫描全市场...")
+    print(f"\n[2/2] 批量加载数据并扫描...")
     sys.stdout.flush()
     today = datetime.now().strftime('%Y-%m-%d')
     start_full = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
-    results = []
     t1 = datetime.now()
 
+    # 批量加载所有股票数据（一次SQL查询）
+    print("  从本地数据库加载数据...")
+    sys.stdout.flush()
+    kline_cache = dl.get_kline_batch(codes, start_full, today)
+    print(f"  成功加载 {len(kline_cache)}/{len(codes)} 只股票数据")
+    sys.stdout.flush()
+
+    results = []
     for i, code in enumerate(codes):
-        df = dl.get_kline(code, start_full, today)
-        if df is None: continue
+        if code not in kline_cache:
+            continue
+        df = kline_cache[code]
         r = detect_pattern(df)
         if r:
             last = df.iloc[-1]

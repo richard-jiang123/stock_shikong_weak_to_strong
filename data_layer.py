@@ -137,7 +137,7 @@ class StockDataLayer:
                     row['volume_ma5'], row['amplitude']
                 ))
             conn.executemany(
-                "INSERT OR REPLACE INTO stock_daily VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO stock_daily VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows
             )
 
@@ -150,26 +150,25 @@ class StockDataLayer:
 
     def update_incremental(self, code, force_full=False):
         """增量更新单只股票数据"""
+        end_date = datetime.now().strftime('%Y-%m-%d')
+
         if force_full:
             start_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
         else:
             last_date = self.get_last_date(code)
             if last_date:
-                # 增量：从最后日期之后开始
+                # 如果已经是今天的数据，跳过
+                if last_date == end_date:
+                    return 0
                 last_dt = datetime.strptime(last_date, '%Y-%m-%d')
                 start_date = (last_dt + timedelta(days=1)).strftime('%Y-%m-%d')
             else:
                 # 首次：拉200天
                 start_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
 
-        end_date = datetime.now().strftime('%Y-%m-%d')
-
-        # 如果增量窗口太小或首次，拉完整数据
-        if not last_date or (datetime.now() - datetime.strptime(last_date, '%Y-%m-%d')).days > 10:
-            start_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
-            force_fetch = True
-        else:
-            force_fetch = False
+        # 确保 start_date <= end_date
+        if start_date > end_date:
+            return 0
 
         df = self.fetch_from_api(code, start_date, end_date)
         if df is not None:
@@ -188,6 +187,45 @@ class StockDataLayer:
                 if (i + 1) % 500 == 0 or i + 1 == total:
                     print(f"  更新进度 {i+1}/{total} | 新增 {new_rows} 行")
         return updated, new_rows
+
+    def get_kline_batch(self, codes, start_date=None, end_date=None):
+        """
+        批量获取多只股票的K线数据
+        一次SQL查询读取所有股票数据，比逐只查询快很多
+        """
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        if start_date is None:
+            start_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
+
+        with self._get_conn() as conn:
+            df = pd.read_sql(
+                "SELECT * FROM stock_daily WHERE code IN ({}) AND date>=? AND date<=? ORDER BY code, date".format(
+                    ','.join('?' * len(codes))),
+                conn, params=tuple(codes) + (start_date, end_date),
+                parse_dates=['date']
+            )
+
+        # 按股票分组
+        result = {}
+        for code, group in df.groupby('code'):
+            if len(group) >= 60:
+                result[code] = group.reset_index(drop=True)
+
+        # 数据不足的股票，单独增量更新
+        missing = [c for c in codes if c not in result]
+        for code in missing:
+            self.update_incremental(code)
+            with self._get_conn() as conn:
+                df_single = pd.read_sql(
+                    "SELECT * FROM stock_daily WHERE code=? AND date>=? AND date<=? ORDER BY date",
+                    conn, params=(code, start_date, end_date),
+                    parse_dates=['date']
+                )
+            if len(df_single) >= 60:
+                result[code] = df_single.reset_index(drop=True)
+
+        return result
 
     def get_kline(self, code, start_date=None, end_date=None):
         """

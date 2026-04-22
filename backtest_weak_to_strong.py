@@ -181,18 +181,11 @@ def run_backtest(dl, codes, start_date, end_date, max_stocks=200):
         if industry not in industry_groups: industry_groups[industry] = []
         industry_groups[industry].append(code)
 
-    # 从本地加载数据
-    print("\n从本地加载股票数据...")
-    stock_data_cache = {}
-    loaded = 0
-    for code in selected_codes:
-        df = dl.get_kline(code,
-            (datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=150)).strftime('%Y-%m-%d'),
-            end_date)
-        if df is not None and len(df) > 60:
-            stock_data_cache[code] = df
-            loaded += 1
-    print(f"成功加载 {loaded}/{len(selected_codes)} 只股票数据")
+    # 从本地批量加载数据
+    print("\n从本地批量加载股票数据...")
+    fetch_start = (datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=150)).strftime('%Y-%m-%d')
+    stock_data_cache = dl.get_kline_batch(selected_codes, fetch_start, end_date)
+    print(f"成功加载 {len(stock_data_cache)}/{len(selected_codes)} 只股票数据")
 
     # 板块动量缓存
     sector_cache = {}
