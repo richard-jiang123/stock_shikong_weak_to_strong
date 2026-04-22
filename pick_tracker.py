@@ -137,7 +137,8 @@ class PickTracker:
         Get stock codes from the most recent previous pick date.
 
         Returns:
-            set of code strings (in pick_tracking format, e.g. 'sz.002384')
+            set of code strings in short format (e.g. '002384'), matching
+            the format used by daily_scanner.py for comparison.
         """
         with self._get_conn() as conn:
             cur = conn.execute(
@@ -153,7 +154,8 @@ class PickTracker:
                 prev_date = rows[0][0]
             cur = conn.execute(
                 "SELECT code FROM pick_tracking WHERE pick_date = ?", (prev_date,))
-            return set(r[0] for r in cur.fetchall())
+            # Strip exchange prefix (e.g. 'sz.002384' -> '002384') for comparison
+            return set(r[0].split('.')[1] if '.' in r[0] else r[0] for r in cur.fetchall())
 
     def _get_kline_batch_local(self, codes, start_date, end_date):
         """Query stock_daily from local DB only, no API fallback."""
