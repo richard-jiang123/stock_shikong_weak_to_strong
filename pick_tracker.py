@@ -132,6 +132,29 @@ class PickTracker:
                 count += 1
         return count
 
+    def get_previous_picks(self):
+        """
+        Get stock codes from the most recent previous pick date.
+
+        Returns:
+            set of code strings (in pick_tracking format, e.g. 'sz.002384')
+        """
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "SELECT DISTINCT pick_date FROM pick_tracking ORDER BY pick_date DESC LIMIT 2")
+            rows = cur.fetchall()
+            if len(rows) < 1:
+                return set()
+            # The most recent pick date might be today (already recorded by a previous run),
+            # so we take the second-most-recent if available, otherwise the only one.
+            if len(rows) == 2:
+                prev_date = rows[1][0]
+            else:
+                prev_date = rows[0][0]
+            cur = conn.execute(
+                "SELECT code FROM pick_tracking WHERE pick_date = ?", (prev_date,))
+            return set(r[0] for r in cur.fetchall())
+
     def _get_kline_batch_local(self, codes, start_date, end_date):
         """Query stock_daily from local DB only, no API fallback."""
         if not codes:

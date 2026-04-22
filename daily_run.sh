@@ -57,18 +57,23 @@ end_run() {
 print_summary() {
     log "──────────────── 选股摘要 ────────────────"
     if [ -f today_signals.csv ]; then
-        local count
+        local count new_count repeat_count
         count=$(tail -n +2 today_signals.csv 2>/dev/null | wc -l)
-        log "  当日候选股: $count 只"
+        new_count=$(tail -n +2 today_signals.csv 2>/dev/null | awk -F',' '{print $NF}' | grep -c '是')
+        repeat_count=$((count - new_count))
+        log "  当日候选股: $count 只 (新增 $new_count, 延续 $repeat_count)"
         log ""
         log "  TOP 10:"
-        log "  ┌──────┬──────────┬──────┬───────┬──────┐"
-        log "  │ 排名 │ 代码     │ 名称 │ 评分 │ 信号 │"
-        log "  ├──────┼──────────┼──────┼───────┼──────┤"
+        log "  ┌──────┬──────────┬──────┬───────┬───────┬──────┐"
+        log "  │ 排名 │ 代码     │ 名称 │ 评分 │ 信号  │ 新增 │"
+        log "  ├──────┼──────────┼──────┼───────┼───────┼──────┤"
         head -11 today_signals.csv | tail -10 | while IFS=',' read -r code name close pct signal score rest; do
-            printf "  │ %-4s │ %-8s │ %-4s │ %-5s │ %-4s │\n" "" "$code" "$name" "$score" "$signal" | tee -a "$LOGFILE"
+            is_new=$(echo "$rest" | awk -F',' '{print $NF}')
+            mark=""
+            if [ "$is_new" = "是" ]; then mark="★"; fi
+            printf "  │ %-4s │ %-8s │ %-4s │ %-5s │ %-5s │ %-2s │\n" "" "$code" "$name" "$score" "$signal" "$mark" | tee -a "$LOGFILE"
         done
-        log "  └──────┴──────────┴──────┴───────┴──────┘"
+        log "  └──────┴──────────┴──────┴───────┴───────┴──────┘"
     else
         log "  当日无候选信号"
     fi

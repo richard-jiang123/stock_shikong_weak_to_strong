@@ -180,22 +180,31 @@ def main():
     scan_elapsed = (datetime.now() - t1).total_seconds()
     results.sort(key=lambda x: x['score'], reverse=True)
 
+    # 对比上一期选股，标识新增股票
+    prev_codes = tracker.get_previous_picks()
+    for r in results:
+        r['是否新增'] = '是' if r['code'] not in prev_codes else '否'
+    new_count = sum(1 for r in results if r['是否新增'] == '是')
+    repeat_count = len(results) - new_count
+
     print(f"\n{'='*70}")
-    print(f"完成! 扫描耗时 {scan_elapsed:.1f}s, 发现 {len(results)} 只候选")
+    print(f"完成! 扫描耗时 {scan_elapsed:.1f}s, 发现 {len(results)} 只候选 (新增 {new_count}, 延续 {repeat_count})")
     print(f"{'='*70}")
 
     if results:
-        print(f"\n{'#':<3} {'代码':<10} {'收盘':>7} {'涨幅':>6} {'信号':<12} {'分':>3} {'调':>5}")
-        print("-"*52)
+        print(f"\n{'#':<3} {'代码':<10} {'收盘':>7} {'涨幅':>6} {'信号':<12} {'分':>3} {'调':>5} {'新增':<4}")
+        print("-"*58)
         for i, c in enumerate(results[:20]):
+            tag = '★' if c['是否新增'] == '是' else ' '
             print(f"{i+1:<3} {c['code']:<10} {c['close']:>7.2f} {c['pct_chg']*100:>5.1f}% "
-                  f"{c['signal']:<12} {c['score']:>3} {c['cons_dd']*100:>4.0f}%")
+                  f"{c['signal']:<12} {c['score']:>3} {c['cons_dd']*100:>4.0f}% {tag}")
 
         print(f"\n{'─'*70}")
         print("TOP 10 详细分析")
         print(f"{'─'*70}\n")
         for i, c in enumerate(results[:10]):
-            print(f"  ★ {c['code']}")
+            tag = '[新增]' if c['是否新增'] == '是' else '[延续]'
+            print(f"  ★ {c['code']} {tag}")
             print(f"    收盘 {c['close']:.2f} | 涨幅 {c['pct_chg']*100:+.1f}%")
             print(f"    信号 {c['signal']} | 评分 {c['score']}")
             print(f"    一波涨幅 {c['wave_gain']*100:.0f}% | 回调 {c['cons_dd']*100:.0f}% | 量比 {c['vol_ratio']:.1f}x")
