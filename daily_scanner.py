@@ -13,6 +13,8 @@ warnings = __import__('warnings'); warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_layer import get_data_layer
+from strategy_config import StrategyConfig
+from pick_tracker import PickTracker
 
 CONFIG = {
     'first_wave_min_days': 3, 'first_wave_min_gain': 0.15,
@@ -121,6 +123,13 @@ def main():
     print(f"{'='*40}")
     sys.stdout.flush()
 
+    # 更新已有选股的跟踪状态
+    tracker = PickTracker()
+    stats = tracker.update_tracking()
+    if stats['exited'] > 0:
+        print(f"  跟踪更新: {stats['exited']} 只已退出, {stats['still_active']} 只仍活跃")
+        sys.stdout.flush()
+
     # 2. 本地扫描
     print(f"\n[2/2] 批量加载数据并扫描...")
     sys.stdout.flush()
@@ -198,6 +207,9 @@ def main():
             os.path.join(os.path.dirname(os.path.abspath(__file__)), 'today_signals.csv'),
             index=False, encoding='utf-8-sig')
         print(f"✅ 保存至 today_signals.csv")
+        # Record picks for tracking
+        n_tracked = tracker.record_picks(pd.DataFrame(results))
+        print(f"✅ 已记录 {n_tracked} 只股票用于跟踪")
     else:
         print("\n今日无弱转强信号")
 

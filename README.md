@@ -61,53 +61,73 @@ A-share market quantitative trading system based on the "弱转强" (Weak-to-Str
 ## 系统架构
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    策略应用层                        │
-│  ┌──────────────────┐  ┌──────────────────────────┐ │
-│  │ daily_scanner.py │  │  full_scan.py            │ │
-│  │ 每日选股          │  │  全市场扫描 (CSV输出)     │ │
-│  └────────┬─────────┘  └──────────┬───────────────┘ │
-│           │                       │                 │
-│  ┌────────┴───────────────────────┴───────────────┐ │
-│  │         backtest_weak_to_strong.py             │ │
-│  │            历史回测系统                          │ │
-│  └────────────────────┬──────────────────────────┘ │
-│                       │                            │
-└───────────────────────┼────────────────────────────┘
-                        │
-┌───────────────────────┼────────────────────────────┐
-│                       ▼                            │
-│                  数据层 (data_layer.py)             │
-│  ┌──────────────────────────────────────────────┐  │
-│  │          StockDataLayer                       │  │
-│  │  ┌─────────────┐  ┌──────────────────────┐   │  │
-│  │  │ get_kline() │  │ get_kline_batch()    │   │  │
-│  │  │ 单只查询     │  │ 批量查询 (IN clause) │   │  │
-│  │  └──────┬──────┘  └──────────┬───────────┘   │  │
-│  │         └─────────┬─────────┘                │  │
-│  │                   ▼                          │  │
-│  │  ┌──────────────────────────────────────┐    │  │
-│  │  │   update_incremental()               │    │  │
-│  │  │   增量更新: 只拉最后日期之后的新数据   │    │  │
-│  │  └──────────────────────────────────────┘    │  │
-│  └──────────────────────┬───────────────────────┘  │
-│                         │                          │
-└─────────────────────────┼──────────────────────────┘
-                          │
-┌─────────────────────────┼──────────────────────────┐
-│                         ▼                          │
-│              SQLite 本地缓存 (WAL模式)              │
-│  ┌──────────────────────────────────────────────┐  │
-│  │  stock_meta    │ 代码, 名称, 上市/退市日期    │  │
-│  │  stock_daily   │ OHLCV, MA, 涨跌幅, 振幅      │  │
-│  │  update_log    │ 每只股票最后更新日期/行数    │  │
-│  └──────────────────────────────────────────────┘  │
-│                                                    │
-│  ┌──────────────────────────────────────────────┐  │
-│  │  baostock API (增量源)                       │  │
-│  │  仅当本地数据不足时触发增量拉取               │  │
-│  └──────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      策略应用层                                  │
+│  ┌──────────────┐  ┌───────────────┐  ┌──────────────────────┐  │
+│  │ daily_run.sh │  │daily_scanner.py│  │ generate_scorecard   │  │
+│  │ 每日自动化   │→ │ 每日选股       │  │ report.py            │  │
+│  │ 流程入口     │  │ + 自动跟踪     │  │ 跟踪报告生成         │  │
+│  └──────────────┘  └───────┬───────┘  └──────────┬───────────┘  │
+│                            │                     │              │
+│  ┌─────────────────────────┴─────────────────────┤             │
+│  │ pick_tracker.py                               │             │
+│  │ 选股跟踪模型: 记录/退出模拟/成绩单/趋势对比   │             │
+│  └─────────────────────────┬─────────────────────┘             │
+│                            │                                    │
+│  ┌─────────────────────────┴──────────────────────────────────┐ │
+│  │ strategy_optimizer.py                                      │ │
+│  │ 参数优化模型: 坐标下降 + Walk-Forward 验证                 │ │
+│  └─────────────────────────┬──────────────────────────────────┘ │
+│                            │                                    │
+│  ┌─────────────────────────┴──────────────┐                    │
+│  │  strategy_config.py                     │                    │
+│  │  参数中心: DB存储/读写, 替代硬编码CONFIG │                    │
+│  └─────────────────────────┬──────────────┘                    │
+│                            │                                    │
+│  ┌─────────────────────────┴──────────────┐                    │
+│  │ backtest_weak_to_strong.py             │                    │
+│  │ 历史回测系统                            │                    │
+│  └─────────────────────────┬──────────────┘                    │
+│                            │                                    │
+└────────────────────────────┼────────────────────────────────────┘
+                             │
+┌────────────────────────────┼────────────────────────────────────┐
+│                            ▼                                    │
+│                       数据层 (data_layer.py)                     │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  StockDataLayer                                           │   │
+│  │  ┌─────────────┐  ┌──────────────────────┐               │   │
+│  │  │ get_kline() │  │ get_kline_batch()    │               │   │
+│  │  │ 单只查询     │  │ 批量查询 (IN clause) │               │   │
+│  │  └──────┬──────┘  └──────────┬───────────┘               │   │
+│  │         └─────────┬─────────┘                            │   │
+│  │                   ▼                                      │   │
+│  │  ┌──────────────────────────────────────────┐           │   │
+│  │  │   update_incremental()                    │           │   │
+│  │  │   增量更新: 只拉最后日期之后的新数据       │           │   │
+│  │  └──────────────────────────────────────────┘           │   │
+│  └─────────────────────────┬────────────────────────────────┘   │
+│                            │                                     │
+└────────────────────────────┼─────────────────────────────────────┘
+                             │
+┌────────────────────────────┼─────────────────────────────────────┐
+│                            ▼                                     │
+│                   SQLite 本地缓存 (WAL模式)                       │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  stock_meta       │ 代码, 名称, 上市/退市日期               │ │
+│  │  stock_daily      │ OHLCV, MA, 涨跌幅, 振幅                  │ │
+│  │  update_log       │ 每只股票最后更新日期/行数               │ │
+│  │  index_daily      │ 五大指数OHLCV                           │ │
+│  │  strategy_config  │ 策略参数 (key-value)                    │ │
+│  │  pick_tracking    │ 每日选股记录 + 后续表现                  │ │
+│  │  scorecard        │ 成绩单指标汇总                           │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  baostock API (增量源)                                      │ │
+│  │  仅当本地数据不足时触发增量拉取                               │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ## 文件说明
@@ -116,8 +136,13 @@ A-share market quantitative trading system based on the "弱转强" (Weak-to-Str
 
 | 文件 | 说明 |
 |---|---|
+| `daily_run.sh` | **每日自动化入口**: 扫描 → 跟踪更新 → 生成报告，一键执行 |
 | `data_layer.py` | **数据层**: SQLite 缓存管理，增量更新，批量查询 |
-| `daily_scanner.py` | **每日选股**: 增量更新 + 本地扫描，输出 `today_signals.csv` |
+| `daily_scanner.py` | **每日选股**: 增量更新 + 本地扫描，输出 `today_signals.csv`，自动记录选股用于跟踪 |
+| `strategy_config.py` | **参数中心**: 所有策略参数集中管理，DB 存储/读取，替代硬编码 CONFIG |
+| `pick_tracker.py` | **选股跟踪**: 记录每日选股、模拟后续表现（止损/止盈/时间退出）、生成成绩单 |
+| `generate_scorecard_report.py` | **报告生成**: 从跟踪数据生成 markdown 报告，含胜率、信号效果、评分预测力、操作建议 |
+| `strategy_optimizer.py` | **参数优化**: 坐标下降法 + Walk-Forward 验证，寻找最优参数组合 |
 | `full_scan.py` | **全市场扫描**: 完整版扫描，输出 `today_signals_full.csv` |
 | `backtest_weak_to_strong.py` | **回测系统**: 历史数据回测，输出 `backtest_results.csv` |
 | `analyze_results.py` | **结果分析**: 回测结果统计报告生成 |
@@ -127,10 +152,13 @@ A-share market quantitative trading system based on the "弱转强" (Weak-to-Str
 
 | 文件 | 说明 |
 |---|---|
-| `stock_data.db` | SQLite 数据库 (~120MB，包含全市场K线) |
+| `stock_data.db` | SQLite 数据库 (~120MB，包含全市场K线 + 策略参数 + 选股跟踪) |
 | `today_signals.csv` | 当日选股结果 |
 | `today_signals_full.csv` | 全市场扫描结果 |
 | `backtest_results.csv` | 回测交易明细 |
+| `tracking_report.md` | 选股跟踪报告 (自动生成) |
+| `optimization_summary.json` | 参数优化结果摘要 (自动生成) |
+| `optimization_results.csv` | Walk-Forward 窗口结果 (自动生成) |
 
 ## 安装与使用
 
@@ -155,11 +183,50 @@ python backtest_weak_to_strong.py
 
 ### 日常使用流程
 
-每天收盘后执行：
+**推荐方式**：每天收盘后一键执行，自动完成选股 → 跟踪更新 → 生成报告：
 
 ```bash
-python daily_scanner.py   # 查看当日候选股票
-cat today_signals.csv      # 查看详细结果
+./daily_run.sh   # 完整流程
+```
+
+**分步执行**：
+
+```bash
+./daily_run.sh --scan          # 仅扫描选股
+./daily_run.sh --track         # 仅更新已有选股的跟踪状态
+./daily_run.sh --report        # 仅生成跟踪报告
+./daily_run.sh --scorecard     # 跟踪更新 + 成绩单
+./daily_run.sh --optimize      # 参数优化（坐标下降法）
+./daily_run.sh --walkforward   # Walk-Forward 验证（滚动训练/测试）
+```
+
+**单独调用 Python 模块**：
+
+```bash
+# 选股跟踪（不扫描）
+python pick_tracker.py --action both --lookback 90
+
+# 生成跟踪报告
+python generate_scorecard_report.py --lookback 90 --output tracking_report.md
+
+# 参数优化
+python strategy_optimizer.py --mode coordinate --rounds 3 --sample 200
+python strategy_optimizer.py --mode walkforward --train-window 180 --test-window 60
+python strategy_optimizer.py --mode grid   # 网格搜索（少量参数）
+```
+
+**Cron 自动化**（建议每个交易日 15:30 自动运行）：
+
+```
+30 15 * * 1-5 /path/to/daily_run.sh >> /path/to/daily_run.log 2>&1
+```
+
+**参数优化建议**：每周或每月运行一次 Walk-Forward 验证，检查策略是否仍有效：
+
+```bash
+# 查看优化结果
+cat optimization_summary.json
+cat optimization_results.csv
 ```
 
 ### 性能指标
@@ -423,6 +490,110 @@ if 到达数据最后一条K线:
 | 到期平仓 | 持仓 ≥ 20 天 | 当日收盘价 | 3 |
 | 数据耗尽 | 无更多K线数据 | 最后收盘价 | 4（最低） |
 
+## 跟踪验证系统
+
+> 选股之后如何验证？系统通过 `pick_tracker` 自动记录每日选股，模拟后续表现，生成可量化的验证报告。
+
+### 工作流程
+
+```
+每日扫描 → 选股结果 → 写入 pick_tracking 表
+                          ↓
+                    次日运行 daily_run.sh 时
+                          ↓
+              自动检查每只已选股票的后续 K 线
+                          ↓
+        应用退出规则（止损/止盈/时间退出），更新状态
+                          ↓
+              生成 scorecard + tracking_report.md
+```
+
+### 退出规则（与回测一致）
+
+| 优先级 | 规则 | 触发条件 |
+|---|---|---|
+| 1 | 固定止损 | 盘中最低价 ≤ 入场价 × (1 - stop_loss_buffer) |
+| 2 | 移动止盈 | 持仓>2天 且 从峰值回撤>trailing_stop_pct 且 累计盈利>trailing_min_gain |
+| 3 | 时间退出 | 持仓 ≥ max_hold_days |
+| 4 | 数据结束 | 无更多K线数据，保持 active 状态 |
+
+### 成绩单内容 (`tracking_report.md`)
+
+| 章节 | 内容 |
+|---|---|
+| 总体表现 | 选股数、已退出数、胜率、平均盈亏、持仓天数 |
+| 信号效果 | 各信号类型的胜率对比（异动不跌 vs 阳包阴 vs 大阳反转） |
+| 市场环境 | 上升期/震荡期/退潮期下的选股表现 |
+| 评分预测力 | Spearman 相关系数，验证评分高低是否真的对应盈亏 |
+| 个股排行 | Top 5 盈利 / Top 5 亏损 |
+| 趋势对比 | 近90天 vs 前90天的胜率变化 |
+| 操作建议 | 基于数据自动生成的建议（如降低某信号权重、回避某环境等） |
+
+### 查看成绩单
+
+```bash
+# 一键生成
+./daily_run.sh --report
+
+# 或直接查看
+cat tracking_report.md
+```
+
+## 参数优化系统
+
+> 策略参数是否合理？`strategy_optimizer` 通过系统搜索最优组合，避免凭感觉调参。
+
+### 优化方法
+
+| 方法 | 适用场景 | 速度 |
+|---|---|---|
+| 坐标下降法 (`--mode coordinate`) | 快速找到好参数 | 快（线性复杂度） |
+| Walk-Forward (`--mode walkforward`) | 验证稳健性，防过拟合 | 慢（多窗口） |
+| 网格搜索 (`--mode grid`) | 小范围精细搜索 | 中等（指数增长） |
+
+### Walk-Forward 验证
+
+```
+窗口1: [训练: 180天] → 优化 → [测试: 60天] → 记录 OOS 表现
+窗口2: [训练: 180天(滑动30天)] → 优化 → [测试: 60天] → 记录 OOS 表现
+窗口3: ...
+```
+
+所有窗口的 **Out-of-Sample** 结果汇总，得到推荐的参数组合。
+
+### 可优化的参数
+
+| 参数 | 搜索范围 | 含义 |
+|---|---|---|
+| first_wave_min_days | 2-5 | 一波上涨最少连续天数 |
+| first_wave_min_gain | 0.10-0.25 | 一波上涨最低累计涨幅 |
+| consolidation_max_days | 8-20 | 回调最长持续天数 |
+| consolidation_max_drawdown | 0.10-0.30 | 回调最大允许回撤 |
+| anomaly_amplitude | 0.04-0.08 | 异动不跌所需最小振幅 |
+| stop_loss_buffer | 0.01-0.05 | 止损安全边际 |
+| trailing_stop_pct | 0.05-0.12 | 移动止盈回撤阈值 |
+| trailing_min_gain | 0.05-0.15 | 移动止盈最低盈利要求 |
+| max_hold_days | 10-30 | 最大持仓天数 |
+
+### 目标函数
+
+```
+score = 0.35 × expectancy + 0.25 × win_rate + 0.20 × (1 - max_dd) + 0.10 × sharpe + 0.10 × trade_count_penalty
+```
+
+多目标加权，避免单一指标过拟合。
+
+## 策略参数中心
+
+所有策略参数集中存储在 `strategy_config` 表中，替代原来散落在各文件的硬编码 CONFIG。
+
+| 特性 | 说明 |
+|---|---|
+| 统一存储 | 25 个参数，分 entry / exit / scoring 三类 |
+| 默认回退 | 表中无记录时使用内置 DEFAULTS |
+| 可动态修改 | `strategy_config.py` 提供 set/set_batch 接口 |
+| 快照导出 | `export_snapshot()` 导出 JSON 便于复现 |
+
 ## 设计要点
 
 ### 数据层
@@ -455,16 +626,22 @@ if 到达数据最后一条K线:
 
 ```
 shikong_fufei/
-├── data_layer.py              # 数据层
-├── daily_scanner.py           # 每日选股
-├── full_scan.py               # 全市场扫描
-├── backtest_weak_to_strong.py # 回测系统
-├── analyze_results.py         # 结果分析
-├── init_db.py                 # 首次初始化
-├── stock_data.db              # SQLite缓存 (gitignore)
-├── today_signals.csv          # 当日选股 (gitignore)
-├── today_signals_full.csv     # 全量扫描 (gitignore)
-├── backtest_results.csv       # 回测结果 (gitignore)
+├── daily_run.sh                 # 每日自动化流程入口
+├── data_layer.py                # 数据层
+├── daily_scanner.py             # 每日选股（含自动跟踪）
+├── strategy_config.py           # 参数中心
+├── pick_tracker.py              # 选股跟踪模型
+├── generate_scorecard_report.py # 跟踪报告生成
+├── strategy_optimizer.py        # 参数优化模型
+├── full_scan.py                 # 全市场扫描
+├── backtest_weak_to_strong.py   # 回测系统
+├── analyze_results.py           # 结果分析
+├── init_db.py                   # 首次初始化
+├── stock_data.db                # SQLite缓存 (gitignore)
+├── today_signals.csv            # 当日选股 (gitignore)
+├── tracking_report.md           # 跟踪报告 (自动生成)
+├── optimization_summary.json    # 优化结果 (自动生成)
+├── optimization_results.csv     # 优化窗口结果 (自动生成)
 ├── .gitignore
 └── README.md
 ```

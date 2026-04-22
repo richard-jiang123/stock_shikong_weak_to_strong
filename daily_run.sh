@@ -1,0 +1,149 @@
+#!/bin/bash
+# 弱转强策略 · 每日自动化流程
+# 功能: 扫描选股 -> 更新跟踪 -> 生成报告
+#
+# 用法:
+#   ./daily_run.sh                    # 完整流程（扫描 + 跟踪 + 报告）
+#   ./daily_run.sh --scan             # 仅扫描选股
+#   ./daily_run.sh --track            # 仅更新跟踪
+#   ./daily_run.sh --report           # 仅生成报告
+#   ./daily_run.sh --optimize         # 参数优化（坐标下降）
+#   ./daily_run.sh --walkforward      # Walk-Forward 验证
+#   ./daily_run.sh --scorecard        # 跟踪 + 报告（不扫描）
+#
+# 建议配合 cron 每天收盘后运行:
+#   0 16 * * 1-5 /path/to/daily_run.sh
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+TODAY=$(date '+%Y-%m-%d')
+LOGFILE="${SCRIPT_DIR}/daily_run.log"
+LOOKBACK=90
+OPT_ROUNDS=3
+OPT_SAMPLE=200
+TRAIN_WINDOW=180
+TEST_WINDOW=60
+
+PY="python3"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"
+}
+
+start_run() {
+    echo "" >> "$LOGFILE"
+    log "═══════════════════════════════════════════════════════"
+    log "  弱转强策略 · 每日自动化流程"
+    log "  日期: $TODAY"
+    log "═══════════════════════════════════════════════════════"
+}
+
+end_run() {
+    local status=$1
+    log "═══════════════════════════════════════════════════════"
+    if [ "$status" = "ok" ]; then
+        log "  执行完成: 成功"
+    else
+        log "  执行完成: 失败"
+    fi
+    log "  结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    log "═══════════════════════════════════════════════════════"
+    echo "" >> "$LOGFILE"
+}
+
+print_summary() {
+    log "──────────────── 选股摘要 ────────────────"
+    if [ -f today_signals.csv ]; then
+        local count
+        count=$(tail -n +2 today_signals.csv 2>/dev/null | wc -l)
+        log "  当日候选股: $count 只"
+        log ""
+        log "  TOP 10:"
+        log "  ┌──────┬──────────┬──────┬───────┬──────┐"
+        log "  │ 排名 │ 代码     │ 名称 │ 评分 │ 信号 │"
+        log "  ├──────┼──────────┼──────┼───────┼──────┤"
+        head -11 today_signals.csv | tail -10 | while IFS=',' read -r code name close pct signal score rest; do
+            printf "  │ %-4s │ %-8s │ %-4s │ %-5s │ %-4s │\n" "" "$code" "$name" "$score" "$signal" | tee -a "$LOGFILE"
+        done
+        log "  └──────┴──────────┴──────┴───────┴──────┘"
+    else
+        log "  当日无候选信号"
+    fi
+    log ""
+    log "  完整报告见: tracking_report.md"
+}
+
+run_scan() {
+    log "─────────────── [1/3] 扫描选股 ───────────────"
+    $PY daily_scanner.py 2>&1 | tee -a "$LOGFILE"
+    log "──────────────── 扫描完成 ─────────────────"
+}
+
+run_track() {
+    log "─────────────── [2/3] 更新跟踪 ───────────────"
+    $PY pick_tracker.py --action update 2>&1 | tee -a "$LOGFILE"
+    log "────────────── 跟踪更新完成 ────────────────"
+}
+
+run_report() {
+    log "─────────────── [3/3] 生成报告 ───────────────"
+    $PY generate_scorecard_report.py --lookback $LOOKBACK --output tracking_report.md 2>&1 | tee -a "$LOGFILE"
+    if [ -f tracking_report.md ]; then
+        log "  报告已保存: tracking_report.md"
+        log ""
+        log "────────────── 报告内容 ────────────────"
+        cat tracking_report.md | tee -a "$LOGFILE"
+        log "────────────────────────────────────"
+    fi
+    log "────────────── 报告生成完成 ────────────────"
+}
+
+run_scorecard() {
+    log "─────────────── 生成成绩单 ───────────────"
+    $PY pick_tracker.py --action scorecard --lookback $LOOKBACK 2>&1 | tee -a "$LOGFILE"
+    log "────────────── 成绩单完成 ────────────────"
+}
+
+run_optimize() {
+    log "─────────────── 参数优化（坐标下降） ───────────────"
+    $PY strategy_optimizer.py --mode coordinate \
+        --rounds $OPT_ROUNDS --sample $OPT_SAMPLE 2>&1 | tee -a "$LOGFILE"
+    log "─────────────── 优化完成 ────────────────"
+}
+
+run_walkforward() {
+    log "─────────────── Walk-Forward 验证 ───────────────"
+    $PY strategy_optimizer.py --mode walkforward \
+        --train-window $TRAIN_WINDOW --test-window $TEST_WINDOW --sample $OPT_SAMPLE 2>&1 | tee -a "$LOGFILE"
+    log "─────────────── Walk-Forward 完成 ───────────────"
+}
+
+# ── Main ──
+start_run
+
+case "${1:-all}" in
+    --scan)       run_scan ;;
+    --track)      run_track ;;
+    --report)     run_report ;;
+    --scorecard)  run_scorecard && run_report ;;
+    --optimize)   run_optimize ;;
+    --walkforward) run_walkforward ;;
+    all|"")
+        run_scan
+        echo | tee -a "$LOGFILE"
+        run_track
+        echo | tee -a "$LOGFILE"
+        run_report
+        echo | tee -a "$LOGFILE"
+        print_summary
+        end_run "ok"
+        ;;
+    *)
+        echo "用法: $0 [--scan|--track|--report|--scorecard|--optimize|--walkforward|all]"
+        end_run "fail"
+        exit 1
+        ;;
+esac

@@ -7,6 +7,12 @@
 *.csv
 scan_progress.log
 
+# Auto-generated reports and logs
+tracking_report.md
+daily_run.log
+optimization_summary.json
+optimization_results.csv
+
 # Extracted content
 extracted/
 
