@@ -227,14 +227,20 @@ def run_backtest(dl, codes, start_date, end_date, max_stocks=None):
 
                 industry = industry_func(code)
                 sector_momentum, sector_strong = get_sector_momentum_cached(industry)
+                # 获取信号日当天的市场环境（根据股票所在板块选择对应指数）
+                sig_date_str = str(sig_date.date())
+                index_code = dl.code_to_index(code)
+                market_regime = dl.get_market_regime(sig_date_str, index_code)
                 trade = simulate_trade(df_trade, trade_idx, signal)
                 trade.update({
-                    'stock_code': code, 'signal_date': str(sig_date.date()),
+                    'stock_code': code, 'signal_date': sig_date_str,
                     'signal_type': signal['type'], 'entry_price': signal['entry_price'],
                     'wave_gain': signal['wave_gain'],
                     'consolidation_drawdown': consolidation['max_drawdown'],
                     'industry': industry, 'sector_momentum': sector_momentum,
                     'sector_strong': sector_strong,
+                    'market_regime': market_regime,
+                    'index_code': index_code,
                 })
                 all_trades.append(trade)
     return all_trades
@@ -275,6 +281,13 @@ def analyze_results(trades):
     print(f"\n🔗 板块联动效果:")
     for label, mask in [('板块强势', df['sector_strong']==True), ('板块弱势', df['sector_strong']==False)]:
         sub = df[mask]
+        if len(sub) > 0:
+            print(f"  {label}: {len(sub)}笔 胜率{(sub['pnl_pct']>0).mean()*100:.1f}% 平均{sub['pnl_pct'].mean()*100:+.2f}%")
+    print(f"\n🌍 市场环境效果:")
+    regime_map = {'bull': '上升期', 'range': '震荡期', 'bear': '退潮期'}
+    for regime in ['bull', 'range', 'bear']:
+        sub = df[df['market_regime'] == regime]
+        label = regime_map.get(regime, regime)
         if len(sub) > 0:
             print(f"  {label}: {len(sub)}笔 胜率{(sub['pnl_pct']>0).mean()*100:.1f}% 平均{sub['pnl_pct'].mean()*100:+.2f}%")
     print(f"\n⏱ 持仓天数分布:")

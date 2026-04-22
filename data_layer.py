@@ -18,6 +18,15 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_data.d
 class StockDataLayer:
     """本地数据层：缓存K线数据，增量更新"""
 
+    # 核心指数代码（baostock 格式，带点分隔符）
+    INDEX_CODES = {
+        'sh.000001': '上证指数',
+        'sh.000300': '沪深300',
+        'sz.399001': '深证成指',
+        'sz.399006': '创业板指',
+        'sh.000688': '科创50',
+    }
+
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_PATH
         self._init_db()
@@ -69,6 +78,24 @@ class StockDataLayer:
                     row_count INTEGER,
                     updated_at TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS index_daily (
+                    code TEXT,
+                    date TEXT,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume REAL,
+                    amount REAL,
+                    pct_chg REAL,
+                    ma5 REAL,
+                    ma10 REAL,
+                    ma20 REAL,
+                    PRIMARY KEY (code, date)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_index_date ON index_daily(date);
             ''')
 
     def update_stock_list(self):
@@ -264,6 +291,128 @@ class StockDataLayer:
         with self._get_conn() as conn:
             df = pd.read_sql("SELECT code, name FROM stock_meta", conn)
         return df
+
+    # ==================== 指数数据 ====================
+
+    def update_index_data(self):
+        """更新所有指数数据（增量）"""
+        for code, name in self.INDEX_CODES.items():
+            self._update_index_single(code)
+            print(f"  指数已更新: {name} ({code})")
+
+    def _update_index_single(self, code):
+        """增量更新单个指数数据"""
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        with self._get_conn() as conn:
+            last_date = conn.execute("SELECT MAX(date) FROM index_daily WHERE code=?", (code,)).fetchone()[0]
+
+        if last_date:
+            if last_date == end_date:
+                return 0
+            last_dt = datetime.strptime(last_date, '%Y-%m-%d')
+            start_date = (last_dt + timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+        if start_date > end_date:
+            return 0
+
+        try:
+            rs = bs.query_history_k_data_plus(code,
+                "date,open,high,low,close,volume,amount",
+                start_date=start_date, end_date=end_date,
+                frequency="d", adjustflag="3")
+            df = rs.get_data()
+            if df is None or len(df) < 5:
+                return 0
+            for c in ['open','high','low','close','volume','amount']:
+                df[c] = df[c].astype(float)
+            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+            df = df.sort_values('date').reset_index(drop=True)
+            df['pct_chg'] = df['close'].pct_change()
+            df['ma5'] = df['close'].rolling(5).mean()
+            df['ma10'] = df['close'].rolling(10).mean()
+            df['ma20'] = df['close'].rolling(20).mean()
+
+            with self._get_conn() as conn:
+                rows = []
+                for _, row in df.iterrows():
+                    rows.append((
+                        code, row['date'], row['open'], row['high'], row['low'],
+                        row['close'], row['volume'], row['amount'],
+                        row['pct_chg'], row['ma5'], row['ma10'], row['ma20']
+                    ))
+                conn.executemany(
+                    "INSERT OR REPLACE INTO index_daily VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    rows
+                )
+            return len(df)
+        except Exception:
+            return 0
+
+    def get_index_kline(self, code, start_date=None, end_date=None):
+        """获取指数K线数据"""
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        if start_date is None:
+            start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+        with self._get_conn() as conn:
+            df = pd.read_sql(
+                "SELECT * FROM index_daily WHERE code=? AND date>=? AND date<=? ORDER BY date",
+                conn, params=(code, start_date, end_date),
+                parse_dates=['date']
+            )
+        return df if len(df) > 0 else None
+
+    def get_market_regime(self, date, index_code='sh000300', lookback=20):
+        """
+        判断指定日期某指数对应的市场环境：上升/震荡/退潮
+
+        基于指定指数的 MA 关系判断：
+        - 退潮期(bear): 收盘价在MA20下方 且 MA5 < MA20（趋势向下）
+        - 上升期(bull): 收盘价在MA20上方 且 MA5 > MA10（趋势向上）
+        - 震荡期(range): 其他情况
+
+        Args:
+            date: 日期字符串 'YYYY-MM-DD'
+            index_code: 指数代码，默认 sh000300 (沪深300)
+            lookback: 回看天数，默认20
+
+        Returns:
+            'bull' (上升期), 'range' (震荡期), 'bear' (退潮期)
+        """
+        end_date = date
+        start_date = (datetime.strptime(date, '%Y-%m-%d') - timedelta(days=lookback * 2)).strftime('%Y-%m-%d')
+        df = self.get_index_kline(index_code, start_date, end_date)
+        if df is None or len(df) < lookback:
+            return 'range'
+
+        latest = df.iloc[-1]
+        close = latest['close']
+        ma5 = latest.get('ma5', 0)
+        ma10 = latest.get('ma10', 0)
+        ma20 = latest.get('ma20', 0)
+
+        if ma20 > 0 and close < ma20 and ma5 < ma20:
+            return 'bear'
+        elif ma20 > 0 and close > ma20 and ma5 > ma10:
+            return 'bull'
+        else:
+            return 'range'
+
+    def code_to_index(self, code):
+        """
+        根据股票代码返回对应的大盘指数代码
+        主板 → 沪深300, 创业板 → 创业板指, 科创板 → 科创50
+        """
+        prefix = code.split('.')[1]
+        if prefix.startswith('30'):
+            return 'sz.399006'   # 创业板指
+        elif prefix.startswith('68'):
+            return 'sh.000688'   # 科创50
+        else:
+            return 'sh.000300'   # 沪深300（主板）
 
     def get_cache_stats(self):
         """获取缓存统计"""

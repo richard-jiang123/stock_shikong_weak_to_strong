@@ -95,13 +95,30 @@ def main():
     bs.login()
     dl = get_data_layer()
 
-    # 1. 更新股票列表 + 增量数据
+    # 1. 更新股票列表 + 增量数据 + 指数
     print("\n[1/2] 增量更新数据...")
     stock_list = dl.update_stock_list()
     codes = stock_list['code'].tolist()
     t0 = datetime.now()
     dl.batch_update(codes, verbose=True, total=len(codes))
-    print(f"  增量更新耗时: {(datetime.now()-t0).total_seconds()/60:.1f} 分钟")
+    print(f"  个股增量耗时: {(datetime.now()-t0).total_seconds()/60:.1f} 分钟")
+
+    # 更新指数数据
+    print("\n更新大盘指数数据...")
+    dl.update_index_data()
+
+    # 判断各主要指数对应的市场环境
+    today = datetime.now().strftime('%Y-%m-%d')
+    print(f"\n{'='*40}")
+    print("当前市场环境（按指数）")
+    print(f"{'='*40}")
+    regime_cache = {}
+    for code, name in dl.INDEX_CODES.items():
+        regime = dl.get_market_regime(today, code)
+        regime_name = {'bull': '上升期', 'range': '震荡期', 'bear': '退潮期'}[regime]
+        print(f"  {name}: 【{regime_name}】")
+        regime_cache[code] = regime
+    print(f"{'='*40}")
     sys.stdout.flush()
 
     # 2. 本地扫描
@@ -142,6 +159,9 @@ def main():
                 'score': r['score'], 'wave_gain': r['wg'],
                 'cons_dd': r['dd'], 'vol_ratio': r['vr'],
                 'stop_loss': r['sl'], 'entry': r['ep'],
+                'index': dl.code_to_index(code).split('.')[1],
+                'market_regime': {'bull': '上升期', 'range': '震荡期', 'bear': '退潮期'}.get(
+                    regime_cache.get(dl.code_to_index(code), 'range'), '震荡期'),
                 'reasons': r['reasons'],
             })
         if (i+1) % 500 == 0 or i + 1 == len(codes):
