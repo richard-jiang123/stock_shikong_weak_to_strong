@@ -1,12 +1,10 @@
 # SQLite database
-stock_data.db
-stock_data.db-wal
-stock_data.db-shm
+*.db
+*.db-wal
+*.db-shm
 
-# CSV output
-today_signals.csv
-today_signals_full.csv
-backtest_results.csv
+# CSV files
+*.csv
 scan_progress.log
 
 # Extracted content
