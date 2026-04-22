@@ -317,9 +317,14 @@ if __name__ == '__main__':
         dl.batch_update(codes, verbose=True, total=len(codes))
     else:
         print("\n增量更新数据...")
-        stock_list = dl.update_stock_list()
-        codes = stock_list['code'].tolist()
-        dl.batch_update(codes, verbose=True, total=len(codes))
+        try:
+            stock_list = dl.update_stock_list()
+            codes = stock_list['code'].tolist()
+            dl.batch_update(codes, verbose=True, total=len(codes))
+        except Exception:
+            print("  API更新失败，使用本地已有数据...")
+            stock_list = dl.get_stock_list()
+            codes = stock_list['code'].tolist()
 
     stats = dl.get_cache_stats()
     print(f"\n数据状态: {stats['stocks_with_data']} 只有数据, {stats['total_rows']:,} 行")
