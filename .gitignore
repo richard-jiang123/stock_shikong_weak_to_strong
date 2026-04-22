@@ -1,0 +1,17 @@
+# SQLite database
+stock_data.db
+stock_data.db-wal
+stock_data.db-shm
+
+# CSV output
+today_signals.csv
+today_signals_full.csv
+backtest_results.csv
+scan_progress.log
+
+# Extracted content
+extracted/
+
+# Python
+__pycache__/
+*.pyc

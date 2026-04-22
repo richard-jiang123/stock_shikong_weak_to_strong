@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-弱转强策略 · 聚焦选股
-只扫描回测中表现好的股票 + 今日强势股
+弱转强策略 · 每日选股 v2
+使用本地数据库缓存，增量更新
 """
 import baostock as bs
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import sys
+import os
 warnings = __import__('warnings'); warnings.filterwarnings('ignore')
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from data_layer import get_data_layer
 
 CONFIG = {
     'first_wave_min_days': 3, 'first_wave_min_gain': 0.15,
@@ -69,88 +73,35 @@ def detect_pattern(df):
             'wg': wg, 'dd': dd, 'tp': tp, 'vr': vr,
             'sl': mn*0.98, 'ep': df.iloc[ti]['close']}
 
-def get_kline(code, start, end):
-    try:
-        rs = bs.query_history_k_data_plus(code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start, end_date=end, frequency="d", adjustflag="2")
-        df = rs.get_data()
-        if df is None or len(df) < 60: return None
-        for c in ['open','high','low','close','volume','amount']: df[c] = df[c].astype(float)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date').reset_index(drop=True)
-        df['pct_chg'] = df['close'].pct_change()
-        df['ma5'] = df['close'].rolling(5).mean()
-        df['ma10'] = df['close'].rolling(10).mean()
-        df['ma20'] = df['close'].rolling(20).mean()
-        df['volume_ma5'] = df['volume'].rolling(5).mean()
-        df['amplitude'] = (df['high'] - df['low']) / df['close']
-        return df
-    except: return None
-
 def main():
     print("="*70)
-    print("弱转强策略 · 聚焦选股（100只重点标的）")
-    print(f"日期: {datetime.now().strftime('%Y-%m-%d')}")
+    print("弱转强策略 · 每日选股 v2（本地缓存）")
+    print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*70)
     sys.stdout.flush()
 
     bs.login()
+    dl = get_data_layer()
+
+    # 1. 更新股票列表 + 增量数据
+    print("\n[1/2] 增量更新数据...")
+    stock_list = dl.update_stock_list()
+    codes = stock_list['code'].tolist()
+    t0 = datetime.now()
+    dl.batch_update(codes, verbose=True, total=len(codes))
+    print(f"  增量更新耗时: {(datetime.now()-t0).total_seconds()/60:.1f} 分钟")
+    sys.stdout.flush()
+
+    # 2. 本地扫描
+    print(f"\n[2/2] 本地扫描全市场...")
+    sys.stdout.flush()
     today = datetime.now().strftime('%Y-%m-%d')
     start_full = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
-
-    # 从回测结果中提取有交易记录的股票（已经有弱转强基因的）
-    print("\n加载回测历史候选股...")
-    sys.stdout.flush()
-    try:
-        bt_df = pd.read_csv('/home/jzc/wechat_text/shikong_fufei/backtest_results.csv')
-        historical_codes = bt_df['stock_code'].unique()[:100]  # 取100只
-        print(f"  从回测中提取 {len(historical_codes)} 只历史候选股")
-    except:
-        historical_codes = []
-        print("  回测数据未找到，将使用全市场采样")
-
-    # 获取全市场快照用于补充
-    print("获取今日行情快照...")
-    sys.stdout.flush()
-    rs = bs.query_all_stock(day=today)
-    all_stocks = rs.get_data()
-    mask = all_stocks['code'].str.match(r'^(sh\.60|sz\.00|sz\.30)\d{4}$')
-    all_stocks = all_stocks[mask].copy()
-
-    # 补充一些今日涨幅靠前的股票
-    print("筛选今日强势股补充...")
-    sys.stdout.flush()
-    start_10 = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
-    additional = []
-
-    # 随机采样500只，找今日涨幅大的
-    sample = all_stocks.sample(min(500, len(all_stocks)), random_state=42)
-    for _, row in sample.iterrows():
-        code = row['code']
-        if code in historical_codes: continue
-        df = get_kline(code, start_10, today)
-        if df is None: continue
-        recent_max = df['pct_chg'].max()
-        today_pct = df.iloc[-1]['pct_chg']
-        if recent_max > 0.09 or today_pct > 0.03:
-            additional.append(code)
-
-    # 合并
-    scan_codes = list(historical_codes) + additional[:50]
-    print(f"\n共扫描 {len(scan_codes)} 只股票")
-    print(f"  - 历史候选: {len(historical_codes)}")
-    print(f"  - 今日补充: {len(additional[:50])}")
-    sys.stdout.flush()
-
-    # 扫描
-    print(f"\n开始精细扫描...")
-    sys.stdout.flush()
-    t1 = datetime.now()
     results = []
+    t1 = datetime.now()
 
-    for i, code in enumerate(scan_codes):
-        df = get_kline(code, start_full, today)
+    for i, code in enumerate(codes):
+        df = dl.get_kline(code, start_full, today)
         if df is None: continue
         r = detect_pattern(df)
         if r:
@@ -163,17 +114,16 @@ def main():
                 'stop_loss': r['sl'], 'entry': r['ep'],
                 'reasons': r['reasons'],
             })
-        if (i+1) % 20 == 0:
-            elapsed = (datetime.now() - t1).total_seconds()
-            print(f"  进度 {i+1}/{len(scan_codes)} | 命中 {len(results)} | {elapsed:.0f}s")
+        if (i+1) % 500 == 0 or i + 1 == len(codes):
+            print(f"  扫描 {i+1}/{len(codes)} | 命中 {len(results)}")
             sys.stdout.flush()
 
+    scan_elapsed = (datetime.now() - t1).total_seconds()
     results.sort(key=lambda x: x['score'], reverse=True)
 
     print(f"\n{'='*70}")
-    print(f"找到 {len(results)} 只候选")
+    print(f"完成! 扫描耗时 {scan_elapsed:.1f}s, 发现 {len(results)} 只候选")
     print(f"{'='*70}")
-    sys.stdout.flush()
 
     if results:
         print(f"\n{'#':<3} {'代码':<10} {'收盘':>7} {'涨幅':>6} {'信号':<12} {'分':>3} {'调':>5}")
@@ -181,7 +131,6 @@ def main():
         for i, c in enumerate(results[:20]):
             print(f"{i+1:<3} {c['code']:<10} {c['close']:>7.2f} {c['pct_chg']*100:>5.1f}% "
                   f"{c['signal']:<12} {c['score']:>3} {c['cons_dd']*100:>4.0f}%")
-        sys.stdout.flush()
 
         print(f"\n{'─'*70}")
         print("TOP 10 详细分析")
@@ -194,9 +143,9 @@ def main():
             print(f"    建议止损 {c['stop_loss']:.2f}")
             print(f"    依据: {c['reasons']}")
             print()
-        sys.stdout.flush()
 
-        pd.DataFrame(results).to_csv('/home/jzc/wechat_text/shikong_fufei/today_signals.csv',
+        pd.DataFrame(results).to_csv(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'today_signals.csv'),
             index=False, encoding='utf-8-sig')
         print(f"✅ 保存至 today_signals.csv")
     else:

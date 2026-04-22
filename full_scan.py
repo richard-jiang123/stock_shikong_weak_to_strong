@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""全市场弱转强扫描 - 写入文件供后台查看"""
+"""
+弱转强策略 · 全市场扫描 v2
+使用本地数据库缓存，增量更新
+"""
 import baostock as bs
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import sys, os
+import sys
+import os
+warnings = __import__('warnings'); warnings.filterwarnings('ignore')
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from data_layer import get_data_layer, init_data_layer
 
 CONFIG = {
     'first_wave_min_days': 3, 'first_wave_min_gain': 0.15,
@@ -65,114 +73,99 @@ def detect_pattern(df):
             'wg': wg, 'dd': dd, 'tp': tp, 'vr': vr,
             'sl': mn*0.98, 'ep': df.iloc[ti]['close']}
 
-def get_kline(code, start, end):
-    try:
-        rs = bs.query_history_k_data_plus(code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start, end_date=end, frequency="d", adjustflag="2")
-        df = rs.get_data()
-        if df is None or len(df) < 60: return None
-        for c in ['open','high','low','close','volume','amount']: df[c] = df[c].astype(float)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date').reset_index(drop=True)
-        df['pct_chg'] = df['close'].pct_change()
-        df['ma5'] = df['close'].rolling(5).mean()
-        df['ma10'] = df['close'].rolling(10).mean()
-        df['ma20'] = df['close'].rolling(20).mean()
-        df['volume_ma5'] = df['volume'].rolling(5).mean()
-        df['amplitude'] = (df['high'] - df['low']) / df['close']
-        return df
-    except: return None
-
 def main():
-    log = open('/home/jzc/wechat_text/shikong_fufei/scan_progress.log', 'w', encoding='utf-8')
-    def msg(s):
-        print(s, flush=True)
-        log.write(s + '\n')
-        log.flush()
-
-    msg("="*70)
-    msg("全市场弱转强扫描")
-    msg(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    msg("="*70)
+    print("="*70)
+    print("弱转强策略 · 全市场扫描 v2（本地缓存）")
+    print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*70)
+    sys.stdout.flush()
 
     bs.login()
+    dl = get_data_layer()
+
+    # 1. 更新股票列表
+    print("\n[1/3] 更新股票列表...")
+    stock_list = dl.update_stock_list()
+    codes = stock_list['code'].tolist()
+    total = len(codes)
+    sys.stdout.flush()
+
+    # 2. 增量更新数据
+    print(f"\n[2/3] 增量更新 {total} 只股票数据...")
+    stats_before = dl.get_cache_stats()
+    print(f"  更新前: {stats_before['stocks_with_data']} 只有数据, {stats_before['total_rows']:,} 行")
+    sys.stdout.flush()
+
+    t0 = datetime.now()
+    dl.batch_update(codes, verbose=True, total=total)
+    elapsed = (datetime.now() - t0).total_seconds()
+
+    stats_after = dl.get_cache_stats()
+    print(f"  更新后: {stats_after['stocks_with_data']} 只有数据, {stats_after['total_rows']:,} 行")
+    print(f"  增量更新耗时: {elapsed/60:.1f} 分钟")
+    sys.stdout.flush()
+
+    # 3. 扫描信号
+    print(f"\n[3/3] 本地扫描全市场...")
+    sys.stdout.flush()
     today = datetime.now().strftime('%Y-%m-%d')
     start_full = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
-    t0 = datetime.now()
-
-    # 获取全市场
-    rs = bs.query_all_stock(day=today)
-    all_stocks = rs.get_data()
-    mask = all_stocks['code'].str.match(r'^(sh\.60|sz\.00|sz\.30)\d{4}$')
-    all_stocks = all_stocks[mask].copy()
-    total = len(all_stocks)
-    msg(f"\n全市场 {total} 只A股，开始逐一扫描...")
-    msg(f"预计耗时: 25-35 分钟")
-
     results = []
-    last_report = 0
+    t1 = datetime.now()
 
-    for i, (_, row) in enumerate(all_stocks.iterrows()):
-        code = row['code']
-        df = get_kline(code, start_full, today)
-        if df is not None:
-            r = detect_pattern(df)
-            if r:
-                last = df.iloc[-1]
-                results.append({
-                    'code': code.split('.')[1], 'close': last['close'],
-                    'pct_chg': last['pct_chg'], 'signal': r['sig'],
-                    'score': r['score'], 'wave_gain': r['wg'],
-                    'cons_dd': r['dd'], 'vol_ratio': r['vr'],
-                    'stop_loss': r['sl'], 'entry': r['ep'],
-                    'reasons': r['reasons'],
-                })
+    for i, code in enumerate(codes):
+        df = dl.get_kline(code, start_full, today)
+        if df is None: continue
+        r = detect_pattern(df)
+        if r:
+            last = df.iloc[-1]
+            results.append({
+                'code': code.split('.')[1], 'close': last['close'],
+                'pct_chg': last['pct_chg'], 'signal': r['sig'],
+                'score': r['score'], 'wave_gain': r['wg'],
+                'cons_dd': r['dd'], 'vol_ratio': r['vr'],
+                'stop_loss': r['sl'], 'entry': r['ep'],
+                'reasons': r['reasons'],
+            })
+        if (i+1) % 500 == 0 or i + 1 == total:
+            print(f"  扫描 {i+1}/{total} | 命中 {len(results)}")
+            sys.stdout.flush()
 
-        # 每500只汇报一次
-        if i + 1 - last_report >= 500 or i + 1 == total:
-            elapsed = (datetime.now() - t0).total_seconds()
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            remaining = (total - i - 1) / rate if rate > 0 else 0
-            msg(f"  [{i+1}/{total}] {i+1*100//total:3d}% | 候选 {len(results):2d}只 | "
-                f"已用 {elapsed/60:.1f}分 | 剩余 ~{remaining/60:.0f}分 | "
-                f"速度 {rate:.1f}只/秒")
-            last_report = i + 1
+    scan_elapsed = (datetime.now() - t1).total_seconds()
 
-    elapsed = (datetime.now() - t0).total_seconds()
     results.sort(key=lambda x: x['score'], reverse=True)
 
-    msg(f"\n{'='*70}")
-    msg(f"扫描完成! 总耗时 {elapsed/60:.1f} 分钟, 发现 {len(results)} 只候选")
-    msg(f"{'='*70}")
+    print(f"\n{'='*70}")
+    print(f"完成! 扫描耗时 {scan_elapsed:.1f}s, 发现 {len(results)} 只候选")
+    print(f"{'='*70}")
 
     if results:
-        msg(f"\n{'#':<3} {'代码':<10} {'收盘':>7} {'涨幅':>6} {'信号':<12} {'分':>3} {'调':>5}")
-        msg("-"*52)
+        print(f"\n{'#':<3} {'代码':<10} {'收盘':>7} {'涨幅':>6} {'信号':<12} {'分':>3} {'调':>5}")
+        print("-"*52)
         for i, c in enumerate(results[:20]):
-            msg(f"{i+1:<3} {c['code']:<10} {c['close']:>7.2f} {c['pct_chg']*100:>5.1f}% "
-                f"{c['signal']:<12} {c['score']:>3} {c['cons_dd']*100:>4.0f}%")
+            print(f"{i+1:<3} {c['code']:<10} {c['close']:>7.2f} {c['pct_chg']*100:>5.1f}% "
+                  f"{c['signal']:<12} {c['score']:>3} {c['cons_dd']*100:>4.0f}%")
 
-        msg(f"\n{'─'*70}")
-        msg("TOP 10 详细分析")
-        msg(f"{'─'*70}\n")
+        print(f"\n{'─'*70}")
+        print("TOP 10 详细分析")
+        print(f"{'─'*70}\n")
         for i, c in enumerate(results[:10]):
-            msg(f"  ★ {c['code']}")
-            msg(f"    收盘 {c['close']:.2f} | 涨幅 {c['pct_chg']*100:+.1f}%")
-            msg(f"    信号 {c['signal']} | 评分 {c['score']}")
-            msg(f"    一波涨幅 {c['wave_gain']*100:.0f}% | 回调 {c['cons_dd']*100:.0f}% | 量比 {c['vol_ratio']:.1f}x")
-            msg(f"    建议止损 {c['stop_loss']:.2f}")
-            msg(f"    依据: {c['reasons']}")
-            msg("")
+            print(f"  ★ {c['code']}")
+            print(f"    收盘 {c['close']:.2f} | 涨幅 {c['pct_chg']*100:+.1f}%")
+            print(f"    信号 {c['signal']} | 评分 {c['score']}")
+            print(f"    一波涨幅 {c['wave_gain']*100:.0f}% | 回调 {c['cons_dd']*100:.0f}% | 量比 {c['vol_ratio']:.1f}x")
+            print(f"    建议止损 {c['stop_loss']:.2f}")
+            print(f"    依据: {c['reasons']}")
+            print()
 
-        pd.DataFrame(results).to_csv('/home/jzc/wechat_text/shikong_fufei/today_signals_full.csv',
+        pd.DataFrame(results).to_csv(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'today_signals_full.csv'),
             index=False, encoding='utf-8-sig')
-        msg(f"✅ 全部结果保存至 today_signals_full.csv")
+        print(f"✅ 保存至 today_signals_full.csv")
     else:
-        msg("\n今日全市场无弱转强信号")
+        print("\n今日无弱转强信号")
 
     bs.logout()
-    log.close()
 
 if __name__ == '__main__':
     main()
