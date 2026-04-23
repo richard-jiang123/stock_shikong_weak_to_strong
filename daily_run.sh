@@ -101,7 +101,7 @@ print_summary() {
             is_new=$(echo "$rest" | awk -F',' '{print $NF}')
             mark=""
             if [ "$is_new" = "是" ]; then mark="★"; fi
-            printf "  │ %-2d │ %-6s │ %-10s │ %-2d │ %-8s │ %s │\n" "$rank" "$code" "$name" "$score" "$signal" "$mark" | tee -a "$LOGFILE"
+            printf "[$(date '+%Y-%m-%d %H:%M:%S')]   │ %-2d │ %-6s │ %-10s │ %-2d │ %-8s │ %s │\n" "$rank" "$code" "$name" "$score" "$signal" "$mark" | tee -a "$LOGFILE"
             rank=$((rank + 1))
         done
         log "  └────┴────────┴────────────┴────┴──────────┴───┘"
@@ -141,7 +141,9 @@ run_report() {
         log "  报告已保存: tracking_report.md"
         log ""
         log "────────────── 报告内容 ────────────────"
-        cat tracking_report.md | tee -a "$LOGFILE"
+        while IFS= read -r line; do
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | tee -a "$LOGFILE"
+        done < tracking_report.md
         log "────────────────────────────────────"
     fi
     log "────────────── 报告生成完成 ────────────────"
