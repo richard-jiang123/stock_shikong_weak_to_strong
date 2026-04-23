@@ -93,18 +93,45 @@ print_summary() {
         log "  当日候选股: $count 只 (新增 $new_count, 延续 $repeat_count)"
         log ""
         log "  TOP 10:"
-        log "  ┌────┬────────┬────────────┬────┬──────────┬───┐"
-        log "  │ # │ 代码   │ 名称       │ 分 │ 信号     │ 新│"
-        log "  ├────┼────────┼────────────┼────┼──────────┼───┤"
-        local rank=1
+        log "  ┌────┬────────┬──────────┬────┬──────────┬────┐"
+        log "  │ #  │ 代码   │ 名称     │ 分 │ 信号     │新增│"
+        log "  ├────┼────────┼──────────┼────┼──────────┼────┤"
+        local rank=0
         tail -n +2 "$signals_file" | head -10 | while IFS=',' read -r code name close pct signal score rest; do
-            is_new=$(echo "$rest" | awk -F',' '{print $NF}')
-            mark=""
-            if [ "$is_new" = "是" ]; then mark="★"; fi
-            printf "[$(date '+%Y-%m-%d %H:%M:%S')]   │ %-2d │ %-6s │ %-10s │ %-2d │ %-8s │ %s │\n" "$rank" "$code" "$name" "$score" "$signal" "$mark" | tee -a "$LOGFILE"
             rank=$((rank + 1))
+            is_new=$(echo "$rest" | awk -F',' '{print $NF}')
+            if [ "$is_new" = "是" ]; then mark="★"; else mark=" "; fi
+            # 使用awk处理，按显示宽度填充空格
+            line=$(awk -v r="$rank" -v c="$code" -v n="$name" -v s="$score" -v sg="$signal" -v m="$mark" '
+                BEGIN {
+                    # 计算名称显示宽度（中文字符=2，英文=1）
+                    name_wid = 0
+                    for(i=1; i<=length(n); i++) {
+                        ch = substr(n,i,1)
+                        if(ch > "\x7f") name_wid += 2
+                        else name_wid += 1
+                    }
+                    name_pad = 8 - name_wid
+                    if(name_pad < 0) name_pad = 0
+                    name_out = n substr("        ", 1, name_pad)
+
+                    # 计算信号显示宽度
+                    sig_wid = 0
+                    for(i=1; i<=length(sg); i++) {
+                        ch = substr(sg,i,1)
+                        if(ch > "\x7f") sig_wid += 2
+                        else sig_wid += 1
+                    }
+                    sig_pad = 8 - sig_wid
+                    if(sig_pad < 0) sig_pad = 0
+                    sig_out = sg substr("        ", 1, sig_pad)
+
+                    printf "│ %-2d │ %-6s │ %s │ %-2d │ %s │ %-2s │", r, c, name_out, s, sig_out, m
+                }
+            ')
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')]   $line" | tee -a "$LOGFILE"
         done
-        log "  └────┴────────┴────────────┴────┴──────────┴───┘"
+        log "  └────┴────────┴──────────┴────┴──────────┴────┘"
     else
         log "  当日无候选信号文件"
     fi
