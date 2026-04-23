@@ -75,26 +75,38 @@ end_run() {
 
 print_summary() {
     log "──────────────── 选股摘要 ────────────────"
-    if [ -f today_signals.csv ]; then
+    # 确定信号文件路径
+    local signals_file
+    if [ -n "$SCAN_DATE" ]; then
+        signals_file="${SCAN_DATE//-/}_today_signals.csv"
+    else
+        # 尝试找最新的信号文件
+        signals_file=$(ls -t *_today_signals.csv 2>/dev/null | head -1)
+    fi
+
+    if [ -f "$signals_file" ]; then
         local count new_count repeat_count
-        count=$(tail -n +2 today_signals.csv 2>/dev/null | wc -l)
-        new_count=$(tail -n +2 today_signals.csv 2>/dev/null | awk -F',' '{print $NF}' | grep -c '是')
+        count=$(tail -n +2 "$signals_file" 2>/dev/null | wc -l)
+        new_count=$(tail -n +2 "$signals_file" 2>/dev/null | awk -F',' '{print $NF}' | grep -c '是')
         repeat_count=$((count - new_count))
+        log "  文件: $signals_file"
         log "  当日候选股: $count 只 (新增 $new_count, 延续 $repeat_count)"
         log ""
         log "  TOP 10:"
-        log "  ┌──────┬──────────┬──────┬───────┬───────┬──────┐"
-        log "  │ 排名 │ 代码     │ 名称 │ 评分 │ 信号  │ 新增 │"
-        log "  ├──────┼──────────┼──────┼───────┼───────┼──────┤"
-        head -11 today_signals.csv | tail -10 | while IFS=',' read -r code name close pct signal score rest; do
+        log "  ┌────┬────────┬────────────┬────┬──────────┬───┐"
+        log "  │ # │ 代码   │ 名称       │ 分 │ 信号     │ 新│"
+        log "  ├────┼────────┼────────────┼────┼──────────┼───┤"
+        local rank=1
+        tail -n +2 "$signals_file" | head -10 | while IFS=',' read -r code name close pct signal score rest; do
             is_new=$(echo "$rest" | awk -F',' '{print $NF}')
             mark=""
             if [ "$is_new" = "是" ]; then mark="★"; fi
-            printf "  │ %-4s │ %-8s │ %-4s │ %-5s │ %-5s │ %-2s │\n" "" "$code" "$name" "$score" "$signal" "$mark" | tee -a "$LOGFILE"
+            printf "  │ %-2d │ %-6s │ %-10s │ %-2d │ %-8s │ %s │\n" "$rank" "$code" "$name" "$score" "$signal" "$mark" | tee -a "$LOGFILE"
+            rank=$((rank + 1))
         done
-        log "  └──────┴──────────┴──────┴───────┴───────┴──────┘"
+        log "  └────┴────────┴────────────┴────┴──────────┴───┘"
     else
-        log "  当日无候选信号"
+        log "  当日无候选信号文件"
     fi
     log ""
     log "  完整报告见: tracking_report.md"
@@ -184,16 +196,6 @@ case "$CMD" in
         ;;
     *)
         echo "用法: $0 [--date YYYY-MM-DD] [--scan|--track|--report|--scorecard|--optimize|--walkforward|all]"
-        end_run "fail"
-        exit 1
-        ;;
-esac
-        echo | tee -a "$LOGFILE"
-        print_summary
-        end_run "ok"
-        ;;
-    *)
-        echo "用法: $0 [--scan|--track|--report|--scorecard|--optimize|--walkforward|all]"
         end_run "fail"
         exit 1
         ;;
