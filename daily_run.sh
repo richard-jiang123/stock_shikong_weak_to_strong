@@ -75,69 +75,60 @@ end_run() {
 
 print_summary() {
     log "──────────────── 选股摘要 ────────────────"
-    # 确定信号文件路径
+
     local signals_file
     if [ -n "$SCAN_DATE" ]; then
         signals_file="${SCAN_DATE//-/}_today_signals.csv"
     else
-        # 尝试找最新的信号文件
         signals_file=$(ls -t *_today_signals.csv 2>/dev/null | head -1)
     fi
 
-    if [ -f "$signals_file" ]; then
-        local count new_count repeat_count
-        count=$(tail -n +2 "$signals_file" 2>/dev/null | wc -l)
-        new_count=$(tail -n +2 "$signals_file" 2>/dev/null | awk -F',' '{print $NF}' | grep -c '是')
-        repeat_count=$((count - new_count))
-        log "  文件: $signals_file"
-        log "  当日候选股: $count 只 (新增 $new_count, 延续 $repeat_count)"
+    if [ ! -f "$signals_file" ]; then
+        log "  当日无候选信号文件"
         log ""
-        log "  TOP 10:"
-        log "  ┌────┬────────┬──────────┬────┬──────────┬────┐"
-        log "  │ #  │ 代码   │ 名称     │ 分 │ 信号     │新增│"
-        log "  ├────┼────────┼──────────┼────┼──────────┼────┤"
-        local rank=0
-        tail -n +2 "$signals_file" | head -10 | while IFS=',' read -r code name close pct signal score rest; do
-            rank=$((rank + 1))
-            is_new=$(echo "$rest" | awk -F',' '{print $NF}')
-            if [ "$is_new" = "是" ]; then mark="★"; else mark=" "; fi
-            # 使用awk处理，按显示宽度填充空格
-            line=$(awk -v r="$rank" -v c="$code" -v n="$name" -v s="$score" -v sg="$signal" -v m="$mark" '
-                BEGIN {
-                    # 计算名称显示宽度（中文字符=2，英文=1）
-                    name_wid = 0
-                    for(i=1; i<=length(n); i++) {
-                        ch = substr(n,i,1)
-                        if(ch > "\x7f") name_wid += 2
-                        else name_wid += 1
-                    }
-                    name_pad = 8 - name_wid
-                    if(name_pad < 0) name_pad = 0
-                    name_out = n substr("        ", 1, name_pad)
+        log "  完整报告见: tracking_report.md"
+        return
+    fi
 
-                    # 计算信号显示宽度
-                    sig_wid = 0
-                    for(i=1; i<=length(sg); i++) {
-                        ch = substr(sg,i,1)
-                        if(ch > "\x7f") sig_wid += 2
-                        else sig_wid += 1
-                    }
-                    sig_pad = 8 - sig_wid
-                    if(sig_pad < 0) sig_pad = 0
-                    sig_out = sg substr("        ", 1, sig_pad)
+    local count new_count repeat_count
+    count=$(tail -n +2 "$signals_file" 2>/dev/null | wc -l)
+    new_count=$(tail -n +2 "$signals_file" 2>/dev/null | awk -F',' '{print $NF}' | grep -c '是')
+    repeat_count=$((count - new_count))
+    log "  文件: $signals_file"
+    log "  当日候选股: $count 只 (新增 $new_count, 延续 $repeat_count)"
+    log ""
+    log "  TOP 10:"
 
-                    printf "│ %-2d │ %-6s │ %s │ %-2d │ %s │ %-2s │", r, c, name_out, s, sig_out, m
-                }
-            ')
+    # 生成临时数据文件（序号,代码,名称,分数,信号,新增标记）
+    local tmpfile=$(mktemp)
+    local rank=0
+    tail -n +2 "$signals_file" | head -10 | while IFS=',' read -r code name close pct signal score rest; do
+        rank=$((rank + 1))
+        is_new=$(echo "$rest" | awk -F',' '{print $NF}')
+        mark=" "
+        [ "$is_new" = "是" ] && mark="★"
+        echo "$rank|$code|$name|$score|$signal|$mark" >> "$tmpfile"
+    done
+
+    # 使用 column 自动对齐（-t 表格，-s 指定分隔符，-o 指定输出分隔符）
+    # 注意：Ubuntu 20.04 的 column 可能不支持 -o，但 -t -s 可用，输出默认以空格分隔对齐
+    if command -v column >/dev/null; then
+        # 先用 -t -s 对齐，再用 sed 添加表头（可选）
+        (echo "#|代码|名称|分|信号|新增"; cat "$tmpfile") | column -t -s '|' | while read line; do
             echo "[$(date '+%Y-%m-%d %H:%M:%S')]   $line" | tee -a "$LOGFILE"
         done
-        log "  └────┴────────┴──────────┴────┴──────────┴────┘"
     else
-        log "  当日无候选信号文件"
+        # 降级：制表符分隔
+        (echo "#	代码	名称	分	信号	新增"; cat "$tmpfile") | tr '|' '\t' | while read line; do
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')]   $line" | tee -a "$LOGFILE"
+        done
     fi
+
+    rm -f "$tmpfile"
     log ""
     log "  完整报告见: tracking_report.md"
 }
+
 
 run_scan() {
     log "─────────────── [1/3] 扫描选股 ───────────────"
