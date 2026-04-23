@@ -5,6 +5,7 @@ SQLite 缓存 + 增量更新，替代每次全量拉取 baostock
 """
 import sqlite3
 import os
+import time
 import baostock as bs
 import pandas as pd
 import numpy as np
@@ -96,19 +97,29 @@ class StockDataLayer:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_index_date ON index_daily(date);
+
+                CREATE TABLE IF NOT EXISTS update_session (
+                    id INTEGER PRIMARY KEY,
+                    started_at TEXT,
+                    target_date TEXT,
+                    total_codes INTEGER,
+                    progress INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'running',
+                    finished_at TEXT
+                );
             ''')
 
     def update_stock_list(self):
-        """更新股票列表，失败时回退到本地缓存"""
-        for attempt in range(3):
+        """更新股票列表，失败时回退到本地缓存。假设 baostock 已登录。"""
+        for attempt in range(5):
             try:
                 rs = bs.query_all_stock(day=datetime.now().strftime('%Y-%m-%d'))
                 df = rs.get_data()
-                if df is not None and 'code' in df.columns:
+                if df is not None and 'code' in df.columns and len(df) > 100:
                     break
-            except Exception:
+            except Exception as e:
                 pass
-            import time; time.sleep(2)
+            time.sleep(2)
         else:
             # API 失败，使用本地缓存
             with self._get_conn() as conn:
@@ -131,32 +142,82 @@ class StockDataLayer:
         print(f"  股票列表已更新: {len(df)} 只")
         return df
 
+    def _get_incomplete_count(self, target_date):
+        """检查有多少股票的数据未达到目标日期（最后一条数据早于目标日期）。
+        如果大量股票未更新到目标日期，说明上一次 batch_update 可能中断了。"""
+        with self._get_conn() as conn:
+            # 查询每只股票的最新日期，找出早于目标日期的股票数
+            cur = conn.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT code, MAX(date) as last_date
+                    FROM stock_daily
+                    GROUP BY code
+                    HAVING last_date < ?
+                )
+            """, (target_date,))
+            return cur.fetchone()[0]
+
     def is_all_updated(self, target_date=None):
         """
         检查是否所有股票的数据都已更新到目标日期。
-        先看 stock_daily 全局最大日期，如果已经是目标日期就跳过。
-        如果还没到目标日期，采样检查 5 只股票确认是否真的没有新数据。
+        只检查股票数据（排除指数 sh/sz.000xxx, sh/sz.399xxx）。
+        1. 先看股票数据的最大日期
+        2. 如果最大日期 >= 目标日期，还需：
+           a. 检查该日期是否有足够多的股票数据（≥100只）
+           b. 检查是否还有大量股票未达到目标日期（上次更新中断检测）
+        3. 如果最大日期 < 目标日期，采样检查确认是否真的是非交易日
+           a. 如果非交易日 → 还需检查最大日期是否完整
         返回 (is_ready, max_date, sample_checked)。
         """
         if target_date is None:
             target_date = datetime.now().strftime('%Y-%m-%d')
         with self._get_conn() as conn:
-            cur = conn.execute("SELECT MAX(date) FROM stock_daily")
+            # 只检查股票数据（排除指数）
+            cur = conn.execute("""
+                SELECT MAX(date) FROM stock_daily
+                WHERE code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%'
+            """)
             max_date = cur.fetchone()[0]
             if max_date is None:
                 return False, None, 0
-            # 如果最大日期 >= 目标日期，说明数据已最新
+            # 如果最大日期 >= 目标日期，做两步检查
             if max_date >= target_date:
-                return True, max_date, 0
+                stock_cnt = conn.execute("""
+                    SELECT COUNT(DISTINCT code) FROM stock_daily WHERE date=?
+                    AND (code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%')
+                """, (target_date,)).fetchone()[0]
+                # 至少 100 只股票有数据
+                if stock_cnt < 100:
+                    return False, max_date, stock_cnt
+                # 检查是否有大量股票未达到目标日期（更新中断检测）
+                incomplete = conn.execute("""
+                    SELECT COUNT(*) FROM (
+                        SELECT code, MAX(date) as last_date
+                        FROM stock_daily
+                        WHERE code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%'
+                        GROUP BY code
+                        HAVING last_date < ?
+                    )
+                """, (target_date,)).fetchone()[0]
+                # 如果超过 5% 的股票未更新到目标日期，说明上次更新中断
+                total_with_data = conn.execute("""
+                    SELECT COUNT(DISTINCT code) FROM stock_daily
+                    WHERE code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%'
+                """).fetchone()[0]
+                if total_with_data > 0 and incomplete > max(10, total_with_data * 0.05):
+                    return False, max_date, stock_cnt
+                return True, max_date, stock_cnt
             # 还没到目标日期，但可能是非交易日。采样检查5只活跃股票。
-            cur = conn.execute(
-                "SELECT code FROM stock_daily WHERE date=? LIMIT 5", (max_date,))
+            cur = conn.execute("""
+                SELECT code FROM stock_daily WHERE date=?
+                AND (code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%')
+                LIMIT 5
+            """, (max_date,))
             sample = [r[0] for r in cur.fetchall()]
         if len(sample) < 2:
             return False, max_date, 0
 
-        import baostock as bs
-        bs.login()
+        # 假设 baostock 已在外部登录
         has_today = False
         for code in sample:
             rs = bs.query_history_k_data_plus(code, "date",
@@ -164,13 +225,20 @@ class StockDataLayer:
             if rs.get_data() is not None and len(rs.get_data()) > 0:
                 has_today = True
                 break
-        bs.logout()
 
         if has_today:
             # 今天确实是交易日，需要增量更新
             return False, max_date, len(sample)
         else:
-            # 今天是非交易日，数据已最新
+            # 今天是非交易日 → 还需检查 max_date 是否完整
+            with self._get_conn() as conn:
+                max_date_cnt = conn.execute("""
+                    SELECT COUNT(DISTINCT code) FROM stock_daily WHERE date=?
+                    AND (code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%')
+                """, (max_date,)).fetchone()[0]
+                if max_date_cnt < 100:
+                    # 最大日期数据不完整，需要重新批量更新
+                    return False, max_date, max_date_cnt
             return True, max_date, len(sample)
 
     def get_last_date(self, code):
@@ -180,32 +248,51 @@ class StockDataLayer:
             row = cur.fetchone()
             return row[0] if row and row[0] else None
 
-    def fetch_from_api(self, code, start_date, end_date):
-        """从 baostock 获取数据"""
-        try:
-            rs = bs.query_history_k_data_plus(code,
-                "date,open,high,low,close,volume,amount,turn",
-                start_date=start_date, end_date=end_date,
-                frequency="d", adjustflag="2")
-            df = rs.get_data()
-            if df is None or len(df) < 5:
+    def fetch_from_api(self, code, start_date, end_date, max_retries=3):
+        """从 baostock 获取数据，支持重试（假设已登录）"""
+        for attempt in range(max_retries):
+            try:
+                rs = bs.query_history_k_data_plus(code,
+                    "date,open,high,low,close,volume,amount,turn",
+                    start_date=start_date, end_date=end_date,
+                    frequency="d", adjustflag="2")
+                df = rs.get_data()
+
+                if df is None or len(df) == 0:
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5)
+                        continue
+                    return None
+
+                for c in ['open','high','low','close','volume','amount','turn']:
+                    df[c] = df[c].astype(float)
+                df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+                df = df.sort_values('date').reset_index(drop=True)
+
+                # 计算指标（至少需要5行才能计算ma5等指标，但如果数据不足就只保留基础数据）
+                if len(df) >= 5:
+                    df['pct_chg'] = df['close'].pct_change()
+                    df['ma5'] = df['close'].rolling(5).mean()
+                    df['ma10'] = df['close'].rolling(10).mean()
+                    df['ma20'] = df['close'].rolling(20).mean()
+                    df['volume_ma5'] = df['volume'].rolling(5).mean()
+                    df['amplitude'] = (df['high'] - df['low']) / df['close']
+                else:
+                    # 数据不足时，只计算 pct_chg，其他指标设为 NaN
+                    df['pct_chg'] = df['close'].pct_change()
+                    df['ma5'] = None
+                    df['ma10'] = None
+                    df['ma20'] = None
+                    df['volume_ma5'] = None
+                    df['amplitude'] = (df['high'] - df['low']) / df['close']
+
+                return df
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
                 return None
-            for c in ['open','high','low','close','volume','amount','turn']:
-                df[c] = df[c].astype(float)
-            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-            df = df.sort_values('date').reset_index(drop=True)
-
-            # 计算指标
-            df['pct_chg'] = df['close'].pct_change()
-            df['ma5'] = df['close'].rolling(5).mean()
-            df['ma10'] = df['close'].rolling(10).mean()
-            df['ma20'] = df['close'].rolling(20).mean()
-            df['volume_ma5'] = df['volume'].rolling(5).mean()
-            df['amplitude'] = (df['high'] - df['low']) / df['close']
-
-            return df
-        except Exception as e:
-            return None
+        return None
 
     def save_to_db(self, code, df):
         """保存数据到数据库"""
@@ -261,16 +348,79 @@ class StockDataLayer:
         return 0
 
     def batch_update(self, codes, verbose=False, total=None):
-        """批量增量更新"""
+        """批量增量更新，支持断点续传和 API 恢复等待。"""
+        target_date = datetime.now().strftime('%Y-%m-%d')
+
+        # 清理旧的运行中会话
+        with self._get_conn() as conn:
+            conn.execute("UPDATE update_session SET status='interrupted' WHERE status='running'")
+
+        # 查找最近一次中断的会话，尝试续传
+        resume_from = 0
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "SELECT progress FROM update_session WHERE status='interrupted' ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            if row and row[0] > 0:
+                resume_from = row[0]
+
+        # 创建新会话
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO update_session (started_at, target_date, total_codes, progress, status) VALUES (?,?,?,?,?)",
+                (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), target_date, len(codes), resume_from, 'running'))
+            session_id = cur.lastrowid
+
         updated = 0
         new_rows = 0
+        total_codes = len(codes)
+        consecutive_failures = 0
+        max_consecutive_failures = 100  # 连续失败阈值
+        api_wait_interval = 10  # API恢复等待间隔（秒）
+        api_wait_threshold = 20  # 达到此阈值后开始等待
+
+        if resume_from > 0:
+            print(f"  检测到上次中断，从第 {resume_from + 1}/{total_codes} 只续传...")
+
         for i, code in enumerate(codes):
+            if i < resume_from:
+                continue
             n = self.update_incremental(code)
-            new_rows += n
+            if n > 0:
+                new_rows += n
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                # 当连续失败达到阈值时，等待一段时间让 API 恢复
+                if consecutive_failures == api_wait_threshold:
+                    print(f"  API 连续失败 {consecutive_failures} 次，等待 {api_wait_interval} 秒...")
+                    time.sleep(api_wait_interval)
+                elif consecutive_failures == api_wait_threshold * 2:
+                    print(f"  API 连续失败 {consecutive_failures} 次，再次等待 {api_wait_interval} 秒...")
+                    time.sleep(api_wait_interval)
             updated += 1
+            # 每50只记录一次进度
+            if (i + 1) % 50 == 0:
+                with self._get_conn() as conn:
+                    conn.execute("UPDATE update_session SET progress=? WHERE id=?", (i + 1, session_id))
             if verbose and total:
                 if (i + 1) % 500 == 0 or i + 1 == total:
                     print(f"  更新进度 {i+1}/{total} | 新增 {new_rows} 行")
+            # 最终失败阈值
+            if consecutive_failures >= max_consecutive_failures:
+                print(f"\n  ✗ API 连续失败 {max_consecutive_failures} 次，停止更新（baostock 不可用）")
+                with self._get_conn() as conn:
+                    conn.execute(
+                        "UPDATE update_session SET status='interrupted', finished_at=? WHERE id=?",
+                        (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), session_id))
+                return updated, new_rows
+
+        # 标记完成
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE update_session SET status='completed', finished_at=? WHERE id=?",
+                (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), session_id))
+
         return updated, new_rows
 
     def get_kline_batch(self, codes, start_date=None, end_date=None):
@@ -291,24 +441,11 @@ class StockDataLayer:
                 parse_dates=['date']
             )
 
-        # 按股票分组
+        # 按股票分组，快速返回
         result = {}
         for code, group in df.groupby('code'):
-            if len(group) >= 60:
+            if len(group) >= 60:  # 保持原有要求，策略需要足够历史数据
                 result[code] = group.reset_index(drop=True)
-
-        # 数据不足的股票，单独增量更新
-        missing = [c for c in codes if c not in result]
-        for code in missing:
-            self.update_incremental(code)
-            with self._get_conn() as conn:
-                df_single = pd.read_sql(
-                    "SELECT * FROM stock_daily WHERE code=? AND date>=? AND date<=? ORDER BY date",
-                    conn, params=(code, start_date, end_date),
-                    parse_dates=['date']
-                )
-            if len(df_single) >= 60:
-                result[code] = df_single.reset_index(drop=True)
 
         return result
 

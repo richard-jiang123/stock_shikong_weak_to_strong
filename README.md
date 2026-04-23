@@ -1,6 +1,6 @@
 # 弱转强 (Weak-to-Strong) 量化交易系统
 
-A-share market quantitative trading system based on the "弱转强" (Weak-to-Strong) pattern, featuring local SQLite caching, incremental data updates, and automated daily screening.
+A股量化交易系统，基于"弱转强"技术形态，支持本地SQLite缓存、增量数据更新、多日期选股回溯。
 
 ## 策略概述
 
@@ -136,9 +136,9 @@ A-share market quantitative trading system based on the "弱转强" (Weak-to-Str
 
 | 文件 | 说明 |
 |---|---|
-| `daily_run.sh` | **每日自动化入口**: 扫描 → 跟踪更新 → 生成报告，一键执行 |
-| `data_layer.py` | **数据层**: SQLite 缓存管理，增量更新，批量查询 |
-| `daily_scanner.py` | **每日选股**: 增量更新 + 本地扫描，输出 `today_signals.csv`，自动记录选股用于跟踪 |
+| `daily_run.sh` | **每日自动化入口**: 支持 `--date` 参数指定扫描日期，日志输出带时间戳 |
+| `data_layer.py` | **数据层**: SQLite缓存管理，增量更新，批量查询，断点续传 |
+| `daily_scanner.py` | **每日选股**: 增量更新 + 本地扫描，输出 `YYYYMMDD_today_signals.csv`，自动记录选股用于跟踪 |
 | `strategy_config.py` | **参数中心**: 所有策略参数集中管理，DB 存储/读取，替代硬编码 CONFIG |
 | `pick_tracker.py` | **选股跟踪**: 记录每日选股、模拟后续表现（止损/止盈/时间退出）、生成成绩单 |
 | `generate_scorecard_report.py` | **报告生成**: 从跟踪数据生成 markdown 报告，含胜率、信号效果、评分预测力、操作建议 |
@@ -153,10 +153,12 @@ A-share market quantitative trading system based on the "弱转强" (Weak-to-Str
 | 文件 | 说明 |
 |---|---|
 | `stock_data.db` | SQLite 数据库 (~120MB，包含全市场K线 + 策略参数 + 选股跟踪) |
-| `today_signals.csv` | 当日选股结果 |
+| `YYYYMMDD_today_signals.csv` | 指定日期选股结果（如 `20260423_today_signals.csv`） |
+| `today_signals.csv` | 当日选股结果（旧格式，逐步淘汰） |
 | `today_signals_full.csv` | 全市场扫描结果 |
 | `backtest_results.csv` | 回测交易明细 |
 | `tracking_report.md` | 选股跟踪报告 (自动生成) |
+| `daily_run.log` | 每日运行日志（带时间戳） |
 | `optimization_summary.json` | 参数优化结果摘要 (自动生成) |
 | `optimization_results.csv` | Walk-Forward 窗口结果 (自动生成) |
 
@@ -186,13 +188,20 @@ python backtest_weak_to_strong.py
 **推荐方式**：每天收盘后一键执行，自动完成选股 → 跟踪更新 → 生成报告：
 
 ```bash
-./daily_run.sh   # 完整流程
+./daily_run.sh   # 完整流程（扫描当天）
+```
+
+**指定日期扫描**（支持回溯历史日期）：
+
+```bash
+./daily_run.sh --date 2026-04-20 --scan   # 扫描指定日期
+./daily_run.sh --date 2026-04-20          # 指定日期完整流程
 ```
 
 **分步执行**：
 
 ```bash
-./daily_run.sh --scan          # 仅扫描选股
+./daily_run.sh --scan          # 仅扫描选股（默认当天）
 ./daily_run.sh --track         # 仅更新已有选股的跟踪状态
 ./daily_run.sh --report        # 仅生成跟踪报告
 ./daily_run.sh --scorecard     # 跟踪更新 + 成绩单
@@ -231,13 +240,15 @@ cat optimization_results.csv
 
 ### 性能指标
 
-| 操作 | v1 (纯API) | v2.1 (缓存+增量) | 提升 |
+| 操作 | v1 (纯API) | v2 (缓存+增量) | 提升 |
 |---|---|---|---|
 | 首次初始化 | N/A | ~100分钟 (一次性) | - |
 | 每日增量更新 | ~97分钟 | **~1分钟** | **97x** |
-| 全市场扫描 | ~97分钟 | **~7分钟** | **14x** |
+| 全市场扫描 | ~97分钟 | **~6分钟** | **16x** |
 | 回测 (200只) | ~10分钟 | **~1分钟** | **10x** |
 | 回测 (全市场4593只) | - | **~15分钟** | - |
+
+> v2 扫描优化：批量SQL查询 + 提前过滤ST股票，从原来~10分钟降至~6分钟。
 
 ## 回测表现
 
@@ -601,7 +612,21 @@ score = 0.35 × expectancy + 0.25 × win_rate + 0.20 × (1 - max_dd) + 0.10 × s
 - **WAL 模式**: SQLite Write-Ahead Logging，支持并发读写
 - **增量更新**: 记录每只股票最后更新日期，只拉新数据
 - **批量查询**: `get_kline_batch()` 使用一条 SQL IN 查询替代逐只查询
-- **自动补全**: 扫描时发现数据不足，自动触发增量更新
+- **断点续传**: 更新中断后自动从上次位置继续，避免重复拉取
+- **API容错**: 连续失败20次等待10秒，100次停止更新并提示
+
+### 数据验证
+
+扫描前自动验证指定日期数据完整性：
+1. 检查指定日期是否有足够股票数据（≥100只）
+2. 数据不完整时自动尝试增量更新（最多2次）
+3. 更新后仍不完整则退出提示，不自动切换日期
+
+### 时间判断
+
+A股15:00收盘，数据约15:30后可用：
+- 15:30前运行 → 自动扫描上一工作日
+- 15:30后运行 → 扫描当天
 
 ### 策略层
 
@@ -626,8 +651,8 @@ score = 0.35 × expectancy + 0.25 × win_rate + 0.20 × (1 - max_dd) + 0.10 × s
 
 ```
 shikong_fufei/
-├── daily_run.sh                 # 每日自动化流程入口
-├── data_layer.py                # 数据层
+├── daily_run.sh                 # 每日自动化流程入口（支持--date参数）
+├── data_layer.py                # 数据层（增量更新+批量查询+断点续传）
 ├── daily_scanner.py             # 每日选股（含自动跟踪）
 ├── strategy_config.py           # 参数中心
 ├── pick_tracker.py              # 选股跟踪模型
@@ -638,8 +663,9 @@ shikong_fufei/
 ├── analyze_results.py           # 结果分析
 ├── init_db.py                   # 首次初始化
 ├── stock_data.db                # SQLite缓存 (gitignore)
-├── today_signals.csv            # 当日选股 (gitignore)
+├── YYYYMMDD_today_signals.csv   # 指定日期选股 (gitignore)
 ├── tracking_report.md           # 跟踪报告 (自动生成)
+├── daily_run.log                # 运行日志 (带时间戳)
 ├── optimization_summary.json    # 优化结果 (自动生成)
 ├── optimization_results.csv     # 优化窗口结果 (自动生成)
 ├── .gitignore

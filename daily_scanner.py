@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import sys
 import os
 import argparse
+import warnings
 warnings = __import__('warnings'); warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -86,36 +87,66 @@ def detect_pattern(df):
             'sl': mn*0.98, 'ep': df.iloc[ti]['close'], 'cons_low': mn}
 
 
-def get_prev_trading_date(dl, target_date=None):
-    """Get the most recent trading day before target_date from local DB."""
+def _find_latest_complete_date(dl, min_stocks=100):
+    """找到最近一个有足够多股票数据的交易日。"""
+    with dl._get_conn() as conn:
+        dates = conn.execute("""
+            SELECT date, COUNT(DISTINCT code) as cnt FROM stock_daily
+            WHERE code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%'
+            GROUP BY date
+            ORDER BY date DESC
+            LIMIT 30
+        """).fetchall()
+        for date, cnt in dates:
+            if cnt >= min_stocks:
+                return date, cnt
+    return None, 0
+
+
+def _get_real_prev_trading_date(target_date=None):
+    """Query baostock to get the actual previous trading date.
+    Assumes baostock is already logged in."""
     if target_date is None:
         target_date = datetime.now().strftime('%Y-%m-%d')
-    with dl._get_conn() as conn:
-        cur = conn.execute(
-            "SELECT DISTINCT date FROM stock_daily WHERE date < ? ORDER BY date DESC LIMIT 1",
-            (target_date,))
-        row = cur.fetchone()
-        return row[0] if row else None
+    td = datetime.strptime(target_date, '%Y-%m-%d')
+    for i in range(1, 30):
+        check_date = (td - timedelta(days=i)).strftime('%Y-%m-%d')
+        rs = bs.query_history_k_data_plus('sh.000001', 'date',
+            start_date=check_date, end_date=check_date, frequency='d')
+        data = rs.get_data()
+        if data is not None and len(data) > 0:
+            return check_date
+    return (td - timedelta(days=1)).strftime('%Y-%m-%d')
+
+
+def _signals_filepath(script_dir, date_str):
+    """Build dated CSV file path: YYYYMMDD_today_signals.csv"""
+    return os.path.join(script_dir, date_str.replace('-', '') + '_today_signals.csv')
 
 
 def _scan_core(dl, codes, regime_cache, name_map, start_date, end_date, verbose=True):
     """
     Run pattern scan for data up to end_date. Returns list of result dicts.
-    The scan checks if the LAST day of each stock's data matches the pattern,
-    so the data must be loaded up to (and including) the target date.
+    Optimized: batch load data first, then fast iteration.
     """
-    kline_cache = dl.get_kline_batch(codes, start_date, end_date)
+    # 提前过滤ST股票
+    filtered_codes = [c for c in codes if 'ST' not in name_map.get(c, '').upper()]
+    if verbose:
+        print(f"  扫描 {len(filtered_codes)} 只股票（已过滤ST）")
+        sys.stdout.flush()
+
+    # 批量加载K线数据
+    kline_cache = dl.get_kline_batch(filtered_codes, start_date, end_date)
+
     results = []
-    for i, code in enumerate(codes):
+    for i, code in enumerate(filtered_codes):
         if code not in kline_cache:
-            continue
-        name = name_map.get(code, '')
-        if 'ST' in name.upper():
             continue
         df = kline_cache[code]
         r = detect_pattern(df)
         if r:
             last = df.iloc[-1]
+            index_code = dl.code_to_index(code).split('.')[1]
             results.append({
                 'code': code.split('.')[1], 'name': name_map.get(code, ''),
                 'close': last['close'],
@@ -123,14 +154,15 @@ def _scan_core(dl, codes, regime_cache, name_map, start_date, end_date, verbose=
                 'score': r['score'], 'wave_gain': r['wg'],
                 'cons_dd': r['dd'], 'vol_ratio': r['vr'],
                 'stop_loss': r['sl'], 'entry': r['ep'],
-                'index': dl.code_to_index(code).split('.')[1],
+                'index': index_code,
                 'market_regime': {'bull': '上升期', 'range': '震荡期', 'bear': '退潮期'}.get(
                     regime_cache.get(dl.code_to_index(code), 'range'), '震荡期'),
                 'reasons': r['reasons'],
             })
-        if verbose and ((i+1) % 500 == 0 or i + 1 == len(codes)):
-            print(f"  扫描 {i+1}/{len(codes)} | 命中 {len(results)}")
+        if verbose and ((i+1) % 500 == 0 or i + 1 == len(filtered_codes)):
+            print(f"  扫描 {i+1}/{len(filtered_codes)} | 命中 {len(results)}")
             sys.stdout.flush()
+
     results.sort(key=lambda x: x['score'], reverse=True)
     return results
 
@@ -223,20 +255,40 @@ def main():
     print("="*70)
     print("弱转强策略 · 每日选股 v2（本地缓存）")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"扫描日期: {target_date}")
+    print(f"指定日期: {target_date}")
     print("="*70)
     sys.stdout.flush()
 
     bs.login()
     dl = get_data_layer()
 
-    # 1. 更新股票列表 + 增量数据 + 指数
+    # 1. 根据时间决定使用哪个日期扫描
+    # A股15:00收盘，15:30前数据未完全落地，使用上一工作日数据
+    now_time = datetime.now()
+    is_after_close = (now_time.hour > 15) or (now_time.hour == 15 and now_time.minute >= 30)
+
+    if not is_after_close:
+        # 15:30前 → 扫描上一工作日
+        effective_scan_date = _get_real_prev_trading_date(target_date)
+        if effective_scan_date:
+            print(f"\n当前时间 {now_time.strftime('%H:%M')}（未收盘），扫描上一工作日: {effective_scan_date}")
+        else:
+            print(f"\n警告: 无法找到上一交易日，使用 {target_date}")
+            effective_scan_date = target_date
+    else:
+        # 15:30后 → 扫描当天
+        effective_scan_date = target_date
+        print(f"\n当前时间 {now_time.strftime('%H:%M')}（已收盘），扫描当天: {effective_scan_date}")
+
+    sys.stdout.flush()
+
+    # 2. 更新股票列表 + 增量数据
     print("\n[1/2] 增量更新数据...")
     stock_list = dl.update_stock_list()
     codes = stock_list['code'].tolist()
 
-    # 检查是否已更新到目标日期，避免重复增量
-    is_ready, max_date, sample_cnt = dl.is_all_updated(target_date)
+    # 检查是否已更新到有效扫描日期
+    is_ready, max_date, sample_cnt = dl.is_all_updated(effective_scan_date)
     if is_ready:
         detail = f"{max_date}"
         if sample_cnt > 0:
@@ -247,59 +299,106 @@ def main():
         dl.batch_update(codes, verbose=True, total=len(codes))
         print(f"  个股增量耗时: {(datetime.now()-t0).total_seconds()/60:.1f} 分钟")
 
+    # 验证数据完整性：检查指定日期是否有足够股票数据
+    # 如果不完整，尝试再次增量更新（最多2次）
+    max_update_attempts = 2
+    for attempt in range(max_update_attempts):
+        with dl._get_conn() as conn:
+            target_cnt = conn.execute("""
+                SELECT COUNT(DISTINCT code) FROM stock_daily WHERE date=?
+                AND (code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%')
+            """, (effective_scan_date,)).fetchone()[0]
+
+        if target_cnt >= 100:
+            # 指定日期数据完整
+            print(f"\n[数据验证] 扫描日期 {effective_scan_date} ✓，{target_cnt} 只股票有数据")
+            break
+
+        # 数据不完整，尝试再次更新
+        if attempt < max_update_attempts - 1:
+            print(f"\n[数据验证] {effective_scan_date} 数据不完整（仅 {target_cnt} 只），尝试再次更新...")
+            t0 = datetime.now()
+            dl.batch_update(codes, verbose=True, total=len(codes))
+            print(f"  再次更新耗时: {(datetime.now()-t0).total_seconds()/60:.1f} 分钟")
+
+    # 最终检查：如果仍不完整，退出提示用户
+    with dl._get_conn() as conn:
+        final_cnt = conn.execute("""
+            SELECT COUNT(DISTINCT code) FROM stock_daily WHERE date=?
+            AND (code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%')
+        """, (effective_scan_date,)).fetchone()[0]
+
+    if final_cnt < 100:
+        print(f"\n✗ 数据不足: 扫描日期 {effective_scan_date} 仅 {final_cnt} 只股票有数据")
+        print(f"   请稍后重试或手动更新数据库。")
+        bs.logout()
+        sys.exit(1)
+
     print("\n更新大盘指数数据...")
     dl.update_index_data()
     sys.stdout.flush()
 
-    # 2. 确定对比基准（上一期选股结果）
+    # 3. 确定对比基准（上一期选股结果）
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    signals_file = os.path.join(script_dir, 'today_signals.csv')
-    prev_codes = _load_prev_csv(signals_file)
 
-    if prev_codes is not None:
-        print(f"\n[对比基准] 已加载上期选股文件: {len(prev_codes)} 只")
-    else:
-        print(f"\n[对比基准] 无上期选股文件，尝试扫描上一交易日...")
-        prev_date = get_prev_trading_date(dl, target_date)
-        if prev_date:
-            print(f"  上一交易日: {prev_date}，开始扫描...")
-            prev_regime, prev_names = _get_regime_and_name(dl, prev_date)
-            scan_start = (datetime.strptime(target_date, '%Y-%m-%d') - timedelta(days=200)).strftime('%Y-%m-%d')
+    # 获取上一期CSV文件路径
+    prev_scan_date = _get_real_prev_trading_date(effective_scan_date)
+    prev_file = _signals_filepath(script_dir, prev_scan_date) if prev_scan_date else None
+
+    prev_codes = None
+    if prev_file and os.path.exists(prev_file):
+        prev_codes = _load_prev_csv(prev_file)
+        if prev_codes is not None:
+            print(f"\n[对比基准] 已加载上期选股文件 {os.path.basename(prev_file)}: {len(prev_codes)} 只")
+        else:
+            prev_codes = None
+
+    if prev_codes is None:
+        # 上一期文件不存在，需要先扫描上一期
+        if prev_scan_date:
+            print(f"\n[对比基准] 无上期选股文件，先扫描 {prev_scan_date} 作为基准...")
+            prev_regime, prev_names = _get_regime_and_name(dl, prev_scan_date)
+            scan_start = (datetime.strptime(effective_scan_date, '%Y-%m-%d') - timedelta(days=200)).strftime('%Y-%m-%d')
             t_scan = datetime.now()
-            prev_results = _scan_core(dl, codes, prev_regime, prev_names, scan_start, prev_date, verbose=True)
+            prev_results = _scan_core(dl, codes, prev_regime, prev_names, scan_start, prev_scan_date, verbose=True)
             prev_elapsed = (datetime.now() - t_scan).total_seconds()
             prev_codes = set(r['code'] for r in prev_results)
-            print(f"  上期({prev_date})扫描耗时 {prev_elapsed:.1f}s, 发现 {len(prev_results)} 只候选")
+            # 保存上一期的结果
+            prev_csv = _signals_filepath(script_dir, prev_scan_date)
+            if prev_results:
+                pd.DataFrame(prev_results).to_csv(prev_csv, index=False, encoding='utf-8-sig')
+                print(f"  已保存 {os.path.basename(prev_csv)} ({len(prev_results)} 只)")
+            print(f"  上期({prev_scan_date})扫描耗时 {prev_elapsed:.1f}s, 发现 {len(prev_results)} 只候选")
         else:
-            print("  无法找到上一交易日，标记为首次扫描")
+            print("\n[对比基准] 无法找到上一交易日，标记为首次扫描")
 
-    # 更新已有选股的跟踪状态
+    # 4. 更新已有选股的跟踪状态
     tracker = PickTracker()
     stats = tracker.update_tracking()
     if stats['exited'] > 0:
         print(f"  跟踪更新: {stats['exited']} 只已退出, {stats['still_active']} 只仍活跃")
         sys.stdout.flush()
 
-    # 3. 扫描目标日期
-    print(f"\n[2/2] 批量加载数据并扫描 ({target_date})...")
+    # 5. 扫描目标日期
+    print(f"\n[2/2] 批量加载数据并扫描 ({effective_scan_date})...")
     sys.stdout.flush()
-    scan_start = (datetime.strptime(target_date, '%Y-%m-%d') - timedelta(days=200)).strftime('%Y-%m-%d')
+    scan_start = (datetime.strptime(effective_scan_date, '%Y-%m-%d') - timedelta(days=200)).strftime('%Y-%m-%d')
     t1 = datetime.now()
 
-    regime_cache, name_map = _get_regime_and_name(dl, target_date)
-    results = _scan_core(dl, codes, regime_cache, name_map, scan_start, target_date, verbose=True)
+    regime_cache, name_map = _get_regime_and_name(dl, effective_scan_date)
+    results = _scan_core(dl, codes, regime_cache, name_map, scan_start, effective_scan_date, verbose=True)
     scan_elapsed = (datetime.now() - t1).total_seconds()
 
     # 打印结果
     _print_results(results, scan_elapsed, prev_codes)
 
-    # 保存
+    # 保存结果（使用带日期的文件名）
+    signals_file = _signals_filepath(script_dir, effective_scan_date)
     if results:
-        pd.DataFrame(results).to_csv(
-            signals_file, index=False, encoding='utf-8-sig')
-        print(f"✅ 保存至 today_signals.csv")
+        pd.DataFrame(results).to_csv(signals_file, index=False, encoding='utf-8-sig')
+        print(f"✅ 保存至 {os.path.basename(signals_file)}")
         # Record picks for tracking
-        n_tracked = tracker.record_picks(pd.DataFrame(results), pick_date=target_date)
+        n_tracked = tracker.record_picks(pd.DataFrame(results), pick_date=effective_scan_date)
         print(f"✅ 已记录 {n_tracked} 只股票用于跟踪")
 
     bs.logout()
