@@ -61,7 +61,7 @@ def detect_pattern(df):
     if df.iloc[ti-1]['amplitude'] > CONFIG['anomaly_amplitude'] and tp > 0.01:
         sig = '异动不跌'
     elif tp > 0.02 and df.iloc[ti-1]['close'] < df.iloc[ti-1]['open'] and df.iloc[ti]['close'] > df.iloc[ti-1]['open']:
-        sig = '阳包阴'
+        sig = '阳包阴 '
     elif tp > CONFIG['weak_strong_threshold'] and df.iloc[ti-1]['close'] < df.iloc[ti-1]['open']:
         sig = '大阳反转'
     elif df.iloc[ti-1]['pct_chg'] > 0.08 and df.iloc[ti-1]['close'] < df.iloc[ti-1]['high']*0.97 and tp > 0.02:
@@ -189,26 +189,42 @@ def _print_results(results, scan_elapsed, prev_codes, verbose=True):
         print("\n当日无弱转强信号")
         return
 
-    print(f"\n{'#':<3} {'代码':<10} {'收盘':>7} {'涨幅':>6} {'信号':<12} {'分':>3} {'调':>5} {'新增':<4}")
-    print("-"*58)
+    # 中文表头，使用固定宽度对齐
+    print()
+    # 中文名称截取前4字符保持对齐
+    print(" #   代码    名称      现价      涨幅    信号       评分  回调  新增")
+    print("-" * 78)
     for i, c in enumerate(results[:20]):
         tag = '★' if c['是否新增'] == '是' else ' '
-        print(f"{i+1:<3} {c['code']:<10} {c['close']:>7.2f} {c['pct_chg']*100:>5.1f}% "
-              f"{c['signal']:<12} {c['score']:>3} {c['cons_dd']*100:>4.0f}% {tag}")
+        code_str = str(c['code'])
+        if '.' in code_str:
+            code_str = code_str.split('.')[1]
+        signal = c['signal']
+        name = c.get('name', '')
+        # 名称截取前4字符
+        name_str = name[:4]
+        print(f"{i+1:>2}   {code_str:<6}  {name_str:<8}  {c['close']:>8.2f}  {c['pct_chg']*100:>6.1f}%  {signal:<10}  {c['score']:>3}   {c['cons_dd']*100:>4.0f}%  {tag}")
 
-    print(f"\n{'─'*70}")
+    print()
+    print("=" * 52)
     print("TOP 10 详细分析")
-    print(f"{'─'*70}\n")
+    print("=" * 52)
+    print()
     for i, c in enumerate(results[:10]):
         tag = '[新增]' if c['是否新增'] == '是' else '[延续]'
         if prev_codes is None:
             tag = '[首次]'
-        print(f"  ★ {c['code']} {tag}")
-        print(f"    收盘 {c['close']:.2f} | 涨幅 {c['pct_chg']*100:+.1f}%")
-        print(f"    信号 {c['signal']} | 评分 {c['score']}")
-        print(f"    一波涨幅 {c['wave_gain']*100:.0f}% | 回调 {c['cons_dd']*100:.0f}% | 量比 {c['vol_ratio']:.1f}x")
-        print(f"    建议止损 {c['stop_loss']:.2f}")
-        print(f"    依据: {c['reasons']}")
+        code_str = str(c['code'])
+        if '.' in code_str:
+            code_str = code_str.split('.')[1]
+        name = c.get('name', '')
+        print(f"  {i+1:>2}. {code_str} {name} {tag}")
+        print(f"      现价: {c['close']:.2f} | 涨幅: {c['pct_chg']*100:+.1f}%")
+        print(f"      信号: {c['signal']} | 评分: {c['score']}")
+        print(f"      波段涨幅: {c['wave_gain']*100:.0f}% | 回调幅度: {c['cons_dd']*100:.0f}% | 量比: {c['vol_ratio']:.1f}x")
+        print(f"      止损位: {c['stop_loss']:.2f}")
+        if c.get('reasons'):
+            print(f"      原因: {c['reasons']}")
         print()
 
     if prev_codes is None:
@@ -288,55 +304,43 @@ def main():
     codes = stock_list['code'].tolist()
 
     # 检查是否已更新到有效扫描日期
-    is_ready, max_date, sample_cnt = dl.is_all_updated(effective_scan_date)
-    if is_ready:
-        detail = f"{max_date}"
-        if sample_cnt > 0:
-            detail += f" (采样 {sample_cnt} 只确认非交易日)"
-        print(f"  数据已是最新（最新 {detail}），跳过增量更新")
+    is_ready, max_date, status_info = dl.is_all_updated(effective_scan_date)
+    reason = status_info.get('reason', 'unknown')
+
+    if reason == 'data_ready':
+        print(f"  数据已是最新（最新 {max_date}），跳过增量更新")
+    elif reason == 'non_trading_day':
+        print(f"  数据已是最新（最新 {max_date}，确认 {effective_scan_date} 为非交易日），跳过增量更新")
+        # 非交易日 → 调整扫描日期为上一交易日
+        effective_scan_date = max_date
+        print(f"  调整扫描日期为上一交易日: {effective_scan_date}")
+    elif reason == 'data_not_updated':
+        print(f"  数据源尚未更新（最新 {max_date}），等待数据更新...")
+        # 数据未更新 → 调整扫描日期为数据库最大日期
+        effective_scan_date = max_date
+        print(f"  调整扫描日期为数据库最新日期: {effective_scan_date}")
     else:
+        # need_update → 执行增量更新
         t0 = datetime.now()
+        # 先检查并更新落后股票
+        lagging_result = dl.update_lagging_stocks(verbose=True)
+        if lagging_result['lagging_count'] > 0:
+            print(f"  落后股票更新完成: {lagging_result['updated']} 只，新增 {lagging_result['new_rows']} 行")
+        # 然后执行正常增量更新
         dl.batch_update(codes, verbose=True, total=len(codes))
         print(f"  个股增量耗时: {(datetime.now()-t0).total_seconds()/60:.1f} 分钟")
 
-    # 验证数据完整性：检查指定日期是否有足够股票数据
-    # 如果不完整，尝试再次增量更新（最多2次）
-    max_update_attempts = 2
-    for attempt in range(max_update_attempts):
-        with dl._get_conn() as conn:
-            target_cnt = conn.execute("""
-                SELECT COUNT(DISTINCT code) FROM stock_daily WHERE date=?
-                AND (code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%')
-            """, (effective_scan_date,)).fetchone()[0]
-
-        if target_cnt >= 100:
-            # 指定日期数据完整
-            print(f"\n[数据验证] 扫描日期 {effective_scan_date} ✓，{target_cnt} 只股票有数据")
-            break
-
-        # 数据不完整，尝试再次更新
-        if attempt < max_update_attempts - 1:
-            print(f"\n[数据验证] {effective_scan_date} 数据不完整（仅 {target_cnt} 只），尝试再次更新...")
-            t0 = datetime.now()
-            dl.batch_update(codes, verbose=True, total=len(codes))
-            print(f"  再次更新耗时: {(datetime.now()-t0).total_seconds()/60:.1f} 分钟")
-
-    # 最终检查：如果仍不完整，退出提示用户
-    with dl._get_conn() as conn:
-        final_cnt = conn.execute("""
-            SELECT COUNT(DISTINCT code) FROM stock_daily WHERE date=?
-            AND (code LIKE 'sh.60%' OR code LIKE 'sz.00%' OR code LIKE 'sz.30%')
-        """, (effective_scan_date,)).fetchone()[0]
-
-    if final_cnt < 100:
-        print(f"\n✗ 数据不足: 扫描日期 {effective_scan_date} 仅 {final_cnt} 只股票有数据")
-        print(f"   请稍后重试或手动更新数据库。")
-        bs.logout()
-        sys.exit(1)
-
+    # 更新大盘指数数据（移到完整性检查前）
     print("\n更新大盘指数数据...")
     dl.update_index_data()
     sys.stdout.flush()
+
+    # 检查数据完整性（bs.login() 已在前面的 batch_update 中执行）
+    is_complete, missing_info = dl.ensure_data_complete(effective_scan_date)
+    if not is_complete:
+        print("\n✗ 数据完整性检查失败，终止扫描")
+        bs.logout()
+        sys.exit(1)
 
     # 3. 确定对比基准（上一期选股结果）
     script_dir = os.path.dirname(os.path.abspath(__file__))

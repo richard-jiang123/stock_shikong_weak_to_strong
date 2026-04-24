@@ -97,12 +97,12 @@ print_summary() {
     log "  文件: $signals_file"
     log "  当日候选股: $count 只 (新增 $new_count, 延续 $repeat_count)"
     log ""
-    log "  TOP 10:"
+    log "  TOP 20:"
 
     # 生成临时数据文件（序号,代码,名称,分数,信号,新增标记）
     local tmpfile=$(mktemp)
     local rank=0
-    tail -n +2 "$signals_file" | head -10 | while IFS=',' read -r code name close pct signal score rest; do
+    tail -n +2 "$signals_file" | head -20 | while IFS=',' read -r code name close pct signal score rest; do
         rank=$((rank + 1))
         is_new=$(echo "$rest" | awk -F',' '{print $NF}')
         mark=" "
