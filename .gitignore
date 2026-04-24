@@ -19,3 +19,6 @@ extracted/
 # Python
 __pycache__/
 *.pyc
+
+# Lock files (runtime generated)
+.locks/
