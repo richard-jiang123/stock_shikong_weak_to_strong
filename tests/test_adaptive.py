@@ -154,5 +154,66 @@ class TestPickTrackingScoreFields(unittest.TestCase):
         self.assertIn('score_base', col_names)
 
 
+class TestStrategyConfigDynamic(unittest.TestCase):
+    """测试 StrategyConfig 动态参数"""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+        # 使用临时文件数据库（:memory: 每个连接独立，无法共享）
+        self.temp_file = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.db_path = self.temp_file.name
+        self.temp_file.close()
+        self.conn = sqlite3.connect(self.db_path)
+
+    def tearDown(self):
+        import os
+        self.conn.close()
+        try:
+            os.unlink(self.db_path)
+        except:
+            pass
+
+    def test_dynamic_params_exist(self):
+        """测试：DYNAMIC_PARAMS 包含 score_weight 类参数"""
+        from strategy_config import StrategyConfig
+        cfg = StrategyConfig(self.db_path)
+
+        self.assertIn('weight_wave_gain', cfg.DYNAMIC_PARAMS)
+        self.assertIn('weight_sector', cfg.DYNAMIC_PARAMS)
+        self.assertIn('activity_coefficient', cfg.DYNAMIC_PARAMS)
+
+    def test_set_dynamic_param_with_category(self):
+        """测试：set() 方法正确处理动态参数"""
+        from strategy_config import StrategyConfig
+        cfg = StrategyConfig(self.db_path)
+
+        # 设置动态参数
+        cfg.set('weight_wave_gain', 1.2)
+
+        # 检查写入正确
+        row = self.conn.execute(
+            "SELECT param_value, description, category FROM strategy_config WHERE param_key='weight_wave_gain'"
+        ).fetchone()
+
+        self.assertEqual(row[0], 1.2)
+        self.assertEqual(row[2], 'score_weight')  # category正确
+
+    def test_get_by_category(self):
+        """测试：get_weights() 返回 score_weight 类参数"""
+        from strategy_config import StrategyConfig
+        cfg = StrategyConfig(self.db_path)
+
+        cfg.set('weight_wave_gain', 1.2)
+        cfg.set('weight_volume', 0.9)
+        cfg.set('first_wave_min_days', 3)  # entry 类
+
+        weights = cfg.get_weights()
+
+        self.assertIn('weight_wave_gain', weights)
+        self.assertIn('weight_volume', weights)
+        self.assertNotIn('first_wave_min_days', weights)
+
+
 if __name__ == '__main__':
     unittest.main()

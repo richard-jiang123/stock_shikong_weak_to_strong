@@ -44,6 +44,25 @@ class StrategyConfig:
         'score_sector_strong':       (5,    'scoring', 'Bonus: strong sector momentum'),
     }
 
+    # 新增：动态参数注册表
+    DYNAMIC_PARAMS = {
+        # score_weight 类参数
+        'weight_wave_gain': (1.0, 'score_weight', '波段涨幅评分权重系数'),
+        'weight_shallow_dd': (1.0, 'score_weight', '浅回调评分权重系数'),
+        'weight_strong_gain': (1.0, 'score_weight', '强势涨幅评分权重系数'),
+        'weight_volume': (1.0, 'score_weight', '放量评分权重系数'),
+        'weight_ma_bull': (1.0, 'score_weight', '多头排列评分权重系数'),
+        'weight_anomaly': (1.0, 'score_weight', '异动信号额外权重'),
+        'weight_sector': (1.0, 'score_weight', '板块动量权重'),
+        'weight_signal_bonus': (1.0, 'score_weight', '信号类型加分权重'),
+
+        # environment 类参数（统一使用 _threshold 命名，与设计文档 B.8 一致）
+        'activity_coefficient': (1.0, 'environment', '当前环境活跃度系数'),
+        'bull_threshold': (1.0, 'environment', '上升期活跃度'),
+        'range_threshold': (0.7, 'environment', '震荡期活跃度'),
+        'bear_threshold': (0.3, 'environment', '退潮期活跃度'),
+    }
+
     def __init__(self, db_path=None):
         if db_path is None:
             db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_data.db')
@@ -113,17 +132,31 @@ class StrategyConfig:
                 result[key] = float(value)
         return result
 
-    def set(self, key, value):
-        """Set a parameter in the database."""
+    def set(self, key, value, description=None, category=None):
+        """Set a parameter in the database, supporting dynamic params."""
+        # 先检查DEFAULTS
+        if key in self.DEFAULTS:
+            default_val = self.DEFAULTS[key]
+            default_desc = default_val[2] if len(default_val) > 2 else ''
+            default_cat = default_val[1] if len(default_val) > 1 else ''
+        elif key in self.DYNAMIC_PARAMS:
+            default_val = self.DYNAMIC_PARAMS[key]
+            default_desc = default_val[2] if len(default_val) > 2 else ''
+            default_cat = default_val[1] if len(default_val) > 1 else ''
+        else:
+            default_desc = description or ''
+            default_cat = category or 'unknown'
+
+        # 使用传入值或默认值
+        final_desc = description or default_desc
+        final_cat = category or default_cat
+
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         with self._get_conn() as conn:
             conn.execute(
                 'INSERT OR REPLACE INTO strategy_config (param_key, param_value, description, category, updated_at) '
                 'VALUES (?, ?, ?, ?, ?)',
-                (key, float(value),
-                 self.DEFAULTS.get(key, (None, None, ''))[2] if key in self.DEFAULTS else '',
-                 self.DEFAULTS.get(key, (None, '', ''))[1] if key in self.DEFAULTS else '',
-                 now)
+                (key, float(value), final_desc, final_cat, now)
             )
 
     def set_batch(self, param_dict):
@@ -131,14 +164,49 @@ class StrategyConfig:
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         with self._get_conn() as conn:
             for key, value in param_dict.items():
+                # 先检查DEFAULTS
+                if key in self.DEFAULTS:
+                    default_val = self.DEFAULTS[key]
+                    default_desc = default_val[2] if len(default_val) > 2 else ''
+                    default_cat = default_val[1] if len(default_val) > 1 else ''
+                elif key in self.DYNAMIC_PARAMS:
+                    default_val = self.DYNAMIC_PARAMS[key]
+                    default_desc = default_val[2] if len(default_val) > 2 else ''
+                    default_cat = default_val[1] if len(default_val) > 1 else ''
+                else:
+                    default_desc = ''
+                    default_cat = 'unknown'
+
                 conn.execute(
                     'INSERT OR REPLACE INTO strategy_config (param_key, param_value, description, category, updated_at) '
                     'VALUES (?, ?, ?, ?, ?)',
-                    (key, float(value),
-                     self.DEFAULTS.get(key, (None, None, ''))[2] if key in self.DEFAULTS else '',
-                     self.DEFAULTS.get(key, (None, '', ''))[1] if key in self.DEFAULTS else '',
-                     now)
+                    (key, float(value), default_desc, default_cat, now)
                 )
+
+    def get_weights(self):
+        """获取所有 score_weight 类参数"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT param_key, param_value FROM strategy_config WHERE category='score_weight'"
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def get_environment(self):
+        """获取所有 environment 类参数"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT param_key, param_value FROM strategy_config WHERE category='environment'"
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def get_by_category(self, category):
+        """按类别获取参数"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT param_key, param_value FROM strategy_config WHERE category=?",
+                (category,)
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
 
     def export_snapshot(self, label=None):
         """Export current config as JSON string for reproducibility."""
