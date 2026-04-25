@@ -323,7 +323,7 @@ CREATE TABLE IF NOT EXISTS optimization_history (
     param_key TEXT,
     old_value REAL,
     new_value REAL,
-    sandbox_test_result TEXT,    -- 'passed' | 'failed' | 'pending'
+    sandbox_test_result TEXT,    -- 'pending' | 'passed' | 'applied' | 'failed'（四态：待验证/验证通过/已应用/验证失败）
     apply_date TEXT,
     -- 回测指标（修订：新增OOS验证指标）
     backtest_train_sharpe REAL,
@@ -405,20 +405,26 @@ def adjust_score_weight(current_weight, correlation, base_weight):
 
 def normalize_scores(scores_dict, weights_dict, base_total=50):
     """
-    归一化评分，使总分均值≈基准值
-
+    [已废弃] 归一化评分，使总分均值≈基准值
+    
+    ⚠️ 此函数基于单样本计算归一化因子，会导致每只股票的归一化系数不同。
+    请使用 B.4 定义的新版 normalize_scores_global() 函数。
+    
+    此函数仅保留作为历史参考，实际实施时不应使用。
+    
     Args:
         scores_dict: 各维度原始评分 {'wave_gain': 10, 'shallow_dd': 15, ...}
         weights_dict: 各维度权重系数 {'wave_gain': 1.2, 'shallow_dd': 0.9, ...}
         base_total: 目标总分均值
-
+    
     Returns:
         normalized_total: 归一化后的总分
+    
+    问题：base_raw = sum(scores_dict.values()) 使用单样本的原始分之和，
+    不同股票的 base_raw 不同，导致归一化系数不统一。
     """
     raw_total = sum(scores_dict[k] * weights_dict[k] for k in scores_dict)
-    # 归一化系数 = base_total / 当前基准总分
-    # 基准总分 = 各维度基准分 × 权重1.0
-    base_raw = sum(scores_dict.values())  # 权重均为1.0时的总分
+    base_raw = sum(scores_dict.values())  # [问题] 单样本基准分
     normalization_factor = base_total / base_raw if base_raw > 0 else 1.0
 
     return raw_total * normalization_factor
@@ -1161,3 +1167,12 @@ ALTER TABLE optimization_history ADD COLUMN validation_started_at TEXT;
 -- 与 created_at 区分：created_at 是变更写入时间，validation_started_at 是验证周期开始时间
 -- 如果验证失败重置，validation_started_at 会随之更新，created_at 保持不变
 ```
+
+---
+
+### B.13 修订汇总（第四轮）
+
+| 评审问题 | 解决方案 | 章节 |
+|----------|----------|------|
+| sandbox_test_result注释缺applied | 补充四态注释 | 正文326行 |
+| normalize_scores与新版并存 | 标注旧版为[已废弃] | 正文406行 |
