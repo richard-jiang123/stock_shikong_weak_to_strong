@@ -647,6 +647,17 @@ pending → passed → applied
  failed → rollback
 ```
 
+**防重复执行机制：**
+
+周四多次执行 `--weekly-optimize` 时，系统通过两层检查避免重复验证：
+
+| 检查 | 条件 | 结果 |
+|------|------|------|
+| `_check_optimization_already_run` | 当天有非 pending 记录 | 返回 `already_run_today` |
+| `_check_has_today_pending` | 当天有 pending 记录 | 返回 `pending_validation_in_progress` |
+
+防止问题：阈值边界附近的 pending 记录因多次 `_make_decision()` 调用导致判定结果翻转（第一次 passed → 第二次 failed）。
+
 ### 一键执行
 
 ```bash

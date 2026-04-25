@@ -55,17 +55,23 @@ class AdaptiveEngine:
         if monitor_date is None:
             monitor_date = datetime.now().strftime('%Y-%m-%d')
 
-        # 执行每日监控
+        # 检查今天是否已经处理过 critical 预警（防止多次执行重复处理）
+        critical_already_handled = self._check_critical_already_handled(monitor_date)
+
+        # 执行每日监控（监控本身可以多次执行，数据更新时需要重新计算）
         alerts = self.monitor.run(monitor_date)
 
-        # 处理 critical 预警
+        # 处理 critical 预警（仅在首次执行时处理）
         critical_alerts = [a for a in alerts if a['severity'] == 'critical']
         critical_handled = 0
 
-        for alert in critical_alerts:
-            handled = self._handle_critical_alert(alert, monitor_date)
-            if handled:
-                critical_handled += 1
+        if not critical_already_handled:
+            for alert in critical_alerts:
+                handled = self._handle_critical_alert(alert, monitor_date)
+                if handled:
+                    critical_handled += 1
+                    # 记录已处理标记
+                    self._mark_critical_handled(monitor_date, alert['type'])
 
         # 确定整体状态
         if critical_alerts:
@@ -111,6 +117,26 @@ class AdaptiveEngine:
                 'applied': 0,
                 'rejected': 0,
                 'reason': 'not_thursday',
+            }
+
+        # 检查今天是否已经执行过优化（防止多次执行）
+        if self._check_optimization_already_run(optimize_date):
+            return {
+                'optimization_results': None,
+                'sandbox_validation': None,
+                'applied': 0,
+                'rejected': 0,
+                'reason': 'already_run_today',
+            }
+
+        # 检查今天是否已经有新创建的 pending 记录（优化已跑但未验证完成）
+        if self._check_has_today_pending(optimize_date):
+            return {
+                'optimization_results': None,
+                'sandbox_validation': None,
+                'applied': 0,
+                'rejected': 0,
+                'reason': 'pending_validation_in_progress',
             }
 
         # 执行四层优化
@@ -258,6 +284,25 @@ class AdaptiveEngine:
                 VALUES (?, ?, ?, ?, 'logged', datetime('now'))
             """, (monitor_date, alert['type'], alert['detail'], 'critical'))
 
+    def _check_critical_already_handled(self, monitor_date):
+        """检查今天是否已经处理过 critical 预警"""
+        with self.dl._get_conn() as conn:
+            # 检查今天是否有 action_taken='handled' 的记录
+            count = conn.execute("""
+                SELECT COUNT(*) FROM daily_monitor_log
+                WHERE monitor_date=? AND action_taken='handled'
+            """, (monitor_date,)).fetchone()[0]
+        return count > 0
+
+    def _mark_critical_handled(self, monitor_date, alert_type):
+        """标记今天已处理某个类型的 critical 预警"""
+        with self.dl._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO daily_monitor_log
+                (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
+                VALUES (?, ?, '', 'critical', 'handled', datetime('now'))
+            """, (monitor_date, alert_type))
+
     def _notify_critical(self, message):
         """发送 critical 通知"""
         for method in self.CRITICAL_CONFIG['notification_methods']:
@@ -306,6 +351,25 @@ class AdaptiveEngine:
 
         # 标记为已应用
         self.sandbox_validator.mark_as_applied(optimize_id)
+
+    def _check_optimization_already_run(self, optimize_date):
+        """检查今天是否已经执行过每周优化（已完成验证的记录）"""
+        with self.dl._get_conn() as conn:
+            # 检查今天是否有优化记录（非 pending 状态）
+            count = conn.execute("""
+                SELECT COUNT(*) FROM optimization_history
+                WHERE optimize_date=? AND sandbox_test_result != 'pending'
+            """, (optimize_date,)).fetchone()[0]
+        return count > 0
+
+    def _check_has_today_pending(self, optimize_date):
+        """检查今天是否有 pending 状态的优化记录（正在验证中）"""
+        with self.dl._get_conn() as conn:
+            count = conn.execute("""
+                SELECT COUNT(*) FROM optimization_history
+                WHERE optimize_date=? AND sandbox_test_result = 'pending'
+            """, (optimize_date,)).fetchone()[0]
+        return count > 0
 
     def get_status_summary(self):
         """
