@@ -609,7 +609,7 @@ SIGNAL_TYPE_MAPPING = {
     'anomaly_no_decline': '异动不跌',
     'bullish_engulfing': '阳包阴',
     'big_bullish_reversal': '大阳反转',
-    'limit_up_open_next': '烂板次日',
+    'limit_up_open_next_strong': '烂板次日',  # 修正：与strategy_optimizer.py:127一致
 }
 
 # 与 pick_tracking 表的 signal 字段映射
@@ -709,15 +709,55 @@ def normalize_scores_global(scores_dict, weights_dict, history_samples):
 
 # 每周优化后更新历史统计
 def update_history_stats(pick_tracking_df):
-    """从 pick_tracking 更新全局评分统计"""
+    """从 pick_tracking 更新全局评分统计
+    
+    注意：依赖 pick_tracking 表的 score_* 字段（见 B.4.1 表结构变更）
+    """
     exited = pick_tracking_df[pick_tracking_df['status'] == 'exited']
     
     stats = {}
-    for dim in ['wave_gain', 'cons_dd', 'day_gain', 'volume', 'ma_bull']:
-        # 从 'reasons' 字段解析各维度原始分，或从 pick_tracking 新增字段读取
-        stats[f'avg_{dim}'] = exited[f'score_{dim}'].mean()  # 需pick_tracking新增字段
+    for dim in ['wave_gain', 'shallow_dd', 'day_gain', 'volume', 'ma_bull', 'sector']:
+        stats[f'avg_{dim}'] = exited[f'score_{dim}'].mean()
     
     return stats
+
+
+"""
+B.4.1 pick_tracking 表结构变更（新增评分维度字段）
+
+现有 pick_tracking 表缺少各维度评分字段，无法支持评分权重归一化。
+需要新增以下字段：
+
+ALTER TABLE pick_tracking ADD COLUMN score_wave_gain REAL;      -- 波段涨幅评分（0/10/20）
+ALTER TABLE pick_tracking ADD COLUMN score_shallow_dd REAL;     -- 回调深度评分（0/10/15）
+ALTER TABLE pick_tracking ADD COLUMN score_day_gain REAL;       -- 当日涨幅评分（0/5/10/15）
+ALTER TABLE pick_tracking ADD COLUMN score_volume REAL;         -- 量比评分（0/5/10）
+ALTER TABLE pick_tracking ADD COLUMN score_ma_bull REAL;        -- 均线排列评分（0/5/10）
+ALTER TABLE pick_tracking ADD COLUMN score_sector REAL;         -- 板块动量评分（0/5）
+ALTER TABLE pick_tracking ADD COLUMN score_signal_bonus REAL;   -- 信号类型加分（0/10）
+ALTER TABLE pick_tracking ADD COLUMN score_base REAL DEFAULT 5; -- 基础分
+
+写入时机：
+  - daily_scanner.py 选股时计算各维度评分，写入 pick_tracking 表
+  - pick_tracker.py record_picks() 方法扩展，接收评分明细
+
+修改示例（daily_scanner.py）：
+
+    results.append({
+        ...
+        '评分明细': {
+            'score_wave_gain': 20 if wg > 0.30 else (10 if wg > 0.20 else 0),
+            'score_shallow_dd': 15 if dd < 0.08 else (10 if dd < 0.15 else 0),
+            'score_day_gain': 15 if tp > 0.07 else (10 if tp > 0.05 else (5 if tp > 0.03 else 0)),
+            'score_volume': 10 if vr > 2 else (5 if vr > 1.5 else 0),
+            'score_ma_bull': 10 if ma5 > ma10 > ma20 else (5 if ma5 > ma10 else 0),
+            'score_sector': 5 if sector_strong else 0,
+            'score_signal_bonus': 10 if sig == '异动不跌' else 0,
+            'score_base': 5,
+        },
+        '评分': total_score,
+    })
+"""
 ```
 
 ---
@@ -729,14 +769,15 @@ def update_history_stats(pick_tracking_df):
 **解决方案：** 加入连续天数要求 + 平滑处理：
 
 ```python
-def get_market_regime_smoothed(index_data, lookback=20, smooth_factor=0.3):
+def get_market_regime_smoothed(index_data, lookback=20, new_value_weight=0.3):
     """
     增强的市场环境判断（连续天数+平滑处理）
     
     Args:
         index_data: 指数K线数据
         lookback: 回看窗口
-        smooth_factor: 平滑系数（new = old*0.7 + raw*0.3）
+        new_value_weight: 新值权重（默认0.3，即新值占30%，旧值占70%）
+                          值越小越保守，值越大越敏感
     
     Returns:
         (regime_type, activity_coefficient, consecutive_days)
@@ -780,9 +821,9 @@ def get_market_regime_smoothed(index_data, lookback=20, smooth_factor=0.3):
         confirmed_regime = prev_regime
         consecutive_days = consecutive_days  # 继续累计
     
-    # 平滑处理活跃度系数
+    # 平滑处理活跃度系数（新值权重0.3 = 新值占30%，旧值占70%）
     prev_coeff = get_previous_activity_coefficient()
-    smoothed_coeff = prev_coeff * (1 - smooth_factor) + raw_coeff * smooth_factor
+    smoothed_coeff = prev_coeff * (1 - new_value_weight) + raw_coeff * new_value_weight
     
     return confirmed_regime, smoothed_coeff, consecutive_days
 ```
@@ -824,15 +865,19 @@ def rolling_sandbox_validate(sandbox_config, weeks_passed):
         week_passed = sandbox_exp >= live_exp * get_threshold(len(sandbox_exits))
         results.append(week_passed)
     
-    # 连续K周通过
-    consecutive_passes = sum(results[-SANDBOX_VALIDATION_CONFIG['min_weeks_to_confirm']:])
+    # 修正：检查最近N周是否全部通过（连续通过）
+    min_weeks = SANDBOX_VALIDATION_CONFIG['min_weeks_to_confirm']
+    recent_results = results[-min_weeks:]
     
-    if consecutive_passes >= SANDBOX_VALIDATION_CONFIG['min_weeks_to_confirm']:
+    # all() 确保全部通过，才是"连续"
+    consecutive_all_passed = all(recent_results) and len(recent_results) >= min_weeks
+    
+    if consecutive_all_passed:
         return {'status': 'passed', 'weeks_evaluated': len(results)}
-    elif len(results) < SANDBOX_VALIDATION_CONFIG['min_weeks_to_confirm']:
+    elif len(results) < min_weeks:
         return {'status': 'evaluating', 'weeks_passed': len(results)}
     else:
-        return {'status': 'failed', 'reason': '连续验证未通过'}
+        return {'status': 'failed', 'reason': '最近{}周未全部通过'.format(min_weeks)}
 ```
 
 ---
@@ -868,10 +913,12 @@ class AdaptiveEngine:
             # 3. 更新信号状态表的live字段
             self._update_signal_live_stats()
             
-            # 4. 检查沙盒状态
+            # 4. 检查沙盒状态（修正：增加已应用检查，防止重复应用）
             sandbox_status = self.sandbox.get_status()
-            if sandbox_status['weeks_passed'] >= 3:
-                self._apply_sandbox_if_passed()
+            # 只有 pending 状态的变更才检查是否通过
+            pending_changes = self.history.get_pending_sandbox_changes()
+            if sandbox_status['weeks_passed'] >= 3 and pending_changes:
+                self._apply_sandbox_if_passed(pending_changes)
             
         except Exception as e:
             self._log_error('daily', e)
@@ -911,14 +958,25 @@ class AdaptiveEngine:
             # 记录到历史
             self.history.record_alert(alert)
     
-    def _apply_sandbox_if_passed(self):
-        """沙盒验证通过后应用"""
-        sandbox_results = self.sandbox.validate()
+    def _apply_sandbox_if_passed(self, pending_changes):
+        """沙盒验证通过后应用（修正：防止重复应用）
+        
+        Args:
+            pending_changes: 待应用的变更列表（status='pending'的记录）
+        """
+        # 再次检查这些变更是否已应用（双重保险）
+        unapplied = [c for c in pending_changes if c.get('sandbox_test_result') == 'pending']
+        if not unapplied:
+            return  # 无待应用变更
+        
+        sandbox_results = self.sandbox.validate(unapplied)
         if sandbox_results['passed']:
             # 应用变更
             for change in sandbox_results['changes']:
                 self._apply_change(change)
+                # 立即标记为已应用，防止重复
                 self.history.record_applied(change)
+                self.sandbox.mark_applied(change['id'])
         else:
             self.history.record_failed(sandbox_results)
 ```
@@ -993,15 +1051,76 @@ class StrategyConfig:
 
 ---
 
-### B.9 修订汇总
+### B.9 sandbox_validator 状态管理（新增，解决重复应用问题）
+
+**问题：** run_daily() 和 run_weekly() 都可以触发 sandbox 应用，缺少互斥。
+
+**解决方案：** sandbox_validator 增加 applied 状态标记：
+
+```python
+# sandbox_validator.py 修改
+
+class SandboxValidator:
+    """沙盒验证器，增加状态管理防止重复应用"""
+    
+    # 沙盒变更状态
+    STATUS_PENDING = 'pending'      # 待验证
+    STATUS_PASSED = 'passed'        # 验证通过，待应用
+    STATUS_APPLIED = 'applied'      # 已应用
+    STATUS_FAILED = 'failed'        # 验证失败
+    
+    def save(self, change):
+        """保存变更到sandbox"""
+        change['sandbox_test_result'] = self.STATUS_PENDING
+        change['weeks_passed'] = 0
+        self._write_to_optimization_history(change)
+    
+    def get_status(self):
+        """获取当前sandbox状态"""
+        pending = self._get_pending_changes()
+        oldest = min(pending, key=lambda x: x['created_at']) if pending else None
+        
+        return {
+            'has_pending': len(pending) > 0,
+            'weeks_passed': oldest['weeks_passed'] if oldest else 0,
+            'pending_count': len(pending),
+        }
+    
+    def mark_applied(self, change_id):
+        """标记变更已应用"""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE optimization_history SET sandbox_test_result = ?, apply_date = ? WHERE id = ?",
+                (self.STATUS_APPLIED, datetime.now().strftime('%Y-%m-%d'), change_id)
+            )
+    
+    def validate(self, pending_changes):
+        """验证待应用变更"""
+        results = []
+        for change in pending_changes:
+            if change['sandbox_test_result'] != self.STATUS_PENDING:
+                continue  # 跳过已处理
+            
+            # 执行验证逻辑
+            validation = self._validate_single(change)
+            if validation['passed']:
+                change['sandbox_test_result'] = self.STATUS_PASSED
+            else:
+                change['sandbox_test_result'] = self.STATUS_FAILED
+            results.append(change)
+        
+        passed = all(c['sandbox_test_result'] == self.STATUS_PASSED for c in results)
+        return {'passed': passed, 'changes': results}
+```
+
+---
+
+### B.10 修订汇总（第二轮）
 
 | 评审问题 | 解决方案 | 章节 |
 |----------|----------|------|
-| 优化器冲突 | weekly_optimizer复用StrategyOptimizer | B.1 |
-| 信号命名不一致 | 英文主键+映射表 | B.2 |
-| daily_run流程不明 | 流程图+依赖关系 | B.3 |
-| 归一化基于单样本 | 改为全局统计均值 | B.4 |
-| 环境判断过于简化 | 连续天数+平滑处理 | B.5 |
-| 沙盒周期过长 | 滚动窗口验证（连续K周通过） | B.6 |
-| 调度逻辑未定义 | 伪代码+异常处理 | B.7 |
-| set()丢失category | 扩展DYNAMIC_PARAMS支持 | B.8 |
+| limit_up_open_next命名不一致 | 统一为 limit_up_open_next_strong | B.2 |
+| pick_tracking缺少评分字段 | 新增 score_* 字段DDL | B.4.1 |
+| consecutive_passes计算错误 | 改用 all() 检查连续通过 | B.6 |
+| smooth_factor命名反直觉 | 改名为 new_value_weight + 注释 | B.5 |
+| sandbox缺少互斥机制 | 增加 STATUS_APPLIED 状态标记 | B.9 |
