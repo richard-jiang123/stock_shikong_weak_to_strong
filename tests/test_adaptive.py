@@ -215,5 +215,36 @@ class TestStrategyConfigDynamic(unittest.TestCase):
         self.assertNotIn('first_wave_min_days', weights)
 
 
+class TestDailyMonitor(unittest.TestCase):
+    """测试每日监控模块"""
+
+    def test_daily_monitor_init(self):
+        """测试：DailyMonitor 初始化"""
+        from daily_monitor import DailyMonitor
+        monitor = DailyMonitor()
+        self.assertIsNotNone(monitor.dl)
+        self.assertIsNotNone(monitor.cfg)
+
+    def test_calculate_expectancy(self):
+        """测试：期望值计算"""
+        from daily_monitor import calculate_expectancy
+
+        # 胜率60%，平均盈利10%，平均亏损5%
+        result = calculate_expectancy(0.6, 0.10, 0.05)
+        expected = 0.10 * 0.6 - 0.05 * 0.4  # 0.06 - 0.02 = 0.04
+        self.assertAlmostEqual(result, 0.04, places=4)
+
+    def test_wilson_expectancy_lower_bound(self):
+        """测试：Wilson置信下界期望值"""
+        from daily_monitor import wilson_expectancy_lower_bound
+
+        # 样本少时置信区间宽
+        result_5 = wilson_expectancy_lower_bound(0.6, 0.10, 0.05, 5)
+        result_50 = wilson_expectancy_lower_bound(0.6, 0.10, 0.05, 50)
+
+        # 样本少时，下界更保守（更低）
+        self.assertLess(result_5, result_50)
+
+
 if __name__ == '__main__':
     unittest.main()
