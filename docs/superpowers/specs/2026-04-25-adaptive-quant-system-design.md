@@ -290,7 +290,8 @@ VALUES
 
 ```sql
 CREATE TABLE IF NOT EXISTS signal_status (
-    signal_type TEXT PRIMARY KEY,           -- '异动不跌' | '阳包阴' | '大阳反转' | '烂板次日'
+    signal_type TEXT PRIMARY KEY,           -- 英文主键：'anomaly_no_decline' | 'bullish_engulfing' | 'big_bullish_reversal' | 'limit_up_open_next_strong'
+    display_name TEXT,                      -- 中文显示：'异动不跌' | '阳包阴' | '大阳反转' | '烂板次日'
     status_level TEXT DEFAULT 'active',     -- 'active' | 'watching' | 'warning' | 'disabled'
     weight_multiplier REAL DEFAULT 1.0,     -- 1.0 / 0.5 / 0.2 / 0
 
@@ -716,7 +717,7 @@ def update_history_stats(pick_tracking_df):
     exited = pick_tracking_df[pick_tracking_df['status'] == 'exited']
     
     stats = {}
-    for dim in ['wave_gain', 'shallow_dd', 'day_gain', 'volume', 'ma_bull', 'sector']:
+    for dim in ['wave_gain', 'shallow_dd', 'day_gain', 'volume', 'ma_bull', 'sector', 'signal_bonus']:  # 修正：加入 signal_bonus 监控
         stats[f'avg_{dim}'] = exited[f'score_{dim}'].mean()
     
     return stats
@@ -1073,17 +1074,29 @@ class SandboxValidator:
         """保存变更到sandbox"""
         change['sandbox_test_result'] = self.STATUS_PENDING
         change['weeks_passed'] = 0
+        change['validation_started_at'] = datetime.now().strftime('%Y-%m-%d')  # 修正：记录验证起始时间
         self._write_to_optimization_history(change)
     
     def get_status(self):
-        """获取当前sandbox状态"""
+        """获取当前sandbox状态
+        
+        修正：使用 validation_started_at（验证起始时间）而非 created_at（创建时间）
+        这样如果中间因验证失败重置过计数器，validation_started_at 会随之更新
+        """
         pending = self._get_pending_changes()
-        oldest = min(pending, key=lambda x: x['created_at']) if pending else None
+        if pending:
+            # 取验证起始时间最早的记录（或直接取最小 weeks_passed）
+            oldest = min(pending, key=lambda x: x['validation_started_at'])
+            min_weeks = min(c['weeks_passed'] for c in pending)
+        else:
+            oldest = None
+            min_weeks = 0
         
         return {
             'has_pending': len(pending) > 0,
-            'weeks_passed': oldest['weeks_passed'] if oldest else 0,
+            'weeks_passed': min_weeks,  # 修正：取最小值，更精确
             'pending_count': len(pending),
+            'validation_started': oldest['validation_started_at'] if oldest else None,
         }
     
     def mark_applied(self, change_id):
@@ -1124,3 +1137,27 @@ class SandboxValidator:
 | consecutive_passes计算错误 | 改用 all() 检查连续通过 | B.6 |
 | smooth_factor命名反直觉 | 改名为 new_value_weight + 注释 | B.5 |
 | sandbox缺少互斥机制 | 增加 STATUS_APPLIED 状态标记 | B.9 |
+
+---
+
+### B.11 修订汇总（第三轮）
+
+| 评审问题 | 解决方案 | 章节 |
+|----------|----------|------|
+| signal_status DDL注释不一致 | 改为英文主键 + display_name | 正文293行 |
+| weeks_passed使用created_at | 新增 validation_started_at 字段 | B.9 |
+| 维度列表遗漏signal_bonus | 加入 'signal_bonus' 监控 | B.4.1 |
+
+---
+
+### B.12 optimization_history 表新增字段（补充）
+
+为支持 validation_started_at，需扩展 optimization_history 表：
+
+```sql
+-- 在原有 optimization_history 表结构基础上新增：
+ALTER TABLE optimization_history ADD COLUMN validation_started_at TEXT;
+-- 验证起始时间（首次开始滚动验证的时间）
+-- 与 created_at 区分：created_at 是变更写入时间，validation_started_at 是验证周期开始时间
+-- 如果验证失败重置，validation_started_at 会随之更新，created_at 保持不变
+```
