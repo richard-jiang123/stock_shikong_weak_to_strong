@@ -98,15 +98,19 @@ class StrategyConfig:
                     )
 
     def get(self, key):
-        """Get a parameter value, falling back to DEFAULTS if not in DB."""
+        """Get a parameter value, falling back to DEFAULTS or DYNAMIC_PARAMS if not in DB."""
         with self._get_conn() as conn:
             row = conn.execute(
                 'SELECT param_value FROM strategy_config WHERE param_key = ?', (key,)
             ).fetchone()
             if row is not None:
                 return row['param_value']
+        # 先检查 DEFAULTS
         if key in self.DEFAULTS:
             return float(self.DEFAULTS[key][0])
+        # 再检查 DYNAMIC_PARAMS
+        if key in self.DYNAMIC_PARAMS:
+            return float(self.DYNAMIC_PARAMS[key][0])
         raise KeyError(f'Unknown parameter: {key}')
 
     def get_dict(self, category=None):
@@ -126,6 +130,12 @@ class StrategyConfig:
                 result[row['param_key']] = row['param_value']
         # Fill in any defaults not in DB
         for key, (value, cat, _) in self.DEFAULTS.items():
+            if category and cat != category:
+                continue
+            if key not in result:
+                result[key] = float(value)
+        # Also fill in DYNAMIC_PARAMS defaults
+        for key, (value, cat, _) in self.DYNAMIC_PARAMS.items():
             if category and cat != category:
                 continue
             if key not in result:
@@ -200,13 +210,25 @@ class StrategyConfig:
         return {r[0]: r[1] for r in rows}
 
     def get_by_category(self, category):
-        """按类别获取参数"""
+        """按类别获取参数，包含默认值"""
         with self._get_conn() as conn:
             rows = conn.execute(
                 "SELECT param_key, param_value FROM strategy_config WHERE category=?",
                 (category,)
             ).fetchall()
-        return {r[0]: r[1] for r in rows}
+        result = {r[0]: r[1] for r in rows}
+
+        # 填充 DEFAULTS 默认值
+        for key, (value, cat, _) in self.DEFAULTS.items():
+            if cat == category and key not in result:
+                result[key] = float(value)
+
+        # 填充 DYNAMIC_PARAMS 默认值
+        for key, (value, cat, _) in self.DYNAMIC_PARAMS.items():
+            if cat == category and key not in result:
+                result[key] = float(value)
+
+        return result
 
     def export_snapshot(self, label=None):
         """Export current config as JSON string for reproducibility."""
