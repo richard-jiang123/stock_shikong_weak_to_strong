@@ -128,8 +128,8 @@ count = len(df)
 new_count = (df['是否新增'] == '是').sum()
 repeat_count = count - new_count
 ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-print(f'{ts}   文件: $signals_file')
-print(f'{ts}   当日候选股: {count} 只 (新增 {new_count}, 延续 {repeat_count})')
+print(f'[{ts}]   文件: $signals_file')
+print(f'[{ts}]   当日候选股: {count} 只 (新增 {new_count}, 延续 {repeat_count})')
 " 2>/dev/null | while IFS= read -r line; do
         log_color "$line"
     done
@@ -265,27 +265,43 @@ run_scan() {
         cmd="$cmd --date $SCAN_DATE"
     fi
     $cmd 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示（保留颜色）
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件（无颜色）
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
     done
+    # 检查管道第一个命令的返回值（PIPESTATUS[0] 是实际命令的返回值）
+    local exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -ne 0 ]; then
+        log "  ✗ 扫描失败 (exit code: $exit_code)"
+        return $exit_code
+    fi
     log "──────────────── 扫描完成 ─────────────────"
 }
 
 run_track() {
     log "─────────────── [2/3] 更新跟踪 ───────────────"
     $PY pick_tracker.py --action update 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示（保留颜色）
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件（无颜色）
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
     done
+    local exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -ne 0 ]; then
+        log "  ✗ 跟踪失败 (exit code: $exit_code)"
+        return $exit_code
+    fi
     log "────────────── 跟踪更新完成 ────────────────"
 }
 
 run_report() {
     log "─────────────── [3/3] 生成报告 ───────────────"
     $PY generate_scorecard_report.py --lookback $LOOKBACK --output tracking_report.md 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
     done
+    local exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -ne 0 ]; then
+        log "  ✗ 报告生成失败 (exit code: $exit_code)"
+        return $exit_code
+    fi
     if [ -f tracking_report.md ]; then
         log "  报告已保存: tracking_report.md"
         log ""
@@ -401,9 +417,14 @@ run_optimize() {
     log "────────── 参数优化（坐标下降） ──────────"
     $PY strategy_optimizer.py --mode coordinate \
         --rounds $OPT_ROUNDS --sample $OPT_SAMPLE 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
     done
+    local exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -ne 0 ]; then
+        log "  ✗ 参数优化失败 (exit code: $exit_code)"
+        return $exit_code
+    fi
     log "─────────────── 优化完成 ─────────────────"
 }
 
@@ -411,35 +432,50 @@ run_walkforward() {
     log "─────────── Walk-Forward 验证 ────────────"
     $PY strategy_optimizer.py --mode walkforward \
         --train-window $TRAIN_WINDOW --test-window $TEST_WINDOW --sample $OPT_SAMPLE 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
     done
+    local exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -ne 0 ]; then
+        log "  ✗ Walk-Forward验证失败 (exit code: $exit_code)"
+        return $exit_code
+    fi
     log "─────────── Walk-Forward 完成 ────────────"
 }
 
 run_monitor() {
     log "─────────────── 每日监控 ───────────────"
     $PY adaptive_engine.py --mode daily ${SCAN_DATE:+--date $SCAN_DATE} 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
     done
+    local exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -ne 0 ]; then
+        log "  ✗ 监控失败 (exit code: $exit_code)"
+        return $exit_code
+    fi
     log "────────────── 监控完成 ────────────────"
 }
 
 run_weekly_optimize() {
     log "─────────────── 每周优化 ───────────────"
     $PY adaptive_engine.py --mode weekly ${SCAN_DATE:+--date $SCAN_DATE} 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
     done
+    local exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -ne 0 ]; then
+        log "  ✗ 每周优化失败 (exit code: $exit_code)"
+        return $exit_code
+    fi
     log "────────────── 优化完成 ────────────────"
 }
 
 run_adaptive_status() {
     log "─────────────── 自适应状态 ───────────────"
     $PY adaptive_engine.py --mode status 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
     done
     log "────────────── 状态查询完成 ───────────────"
 }
@@ -448,9 +484,13 @@ run_adaptive_status() {
 start_run
 
 CMD="${1:-all}"
+
+# 检查是否是周四（每周优化日）
+IS_THURSDAY=$(date +%u)  # 1=周一, 4=周四, 7=周日
+
 case "$CMD" in
     --scan)       run_scan; print_summary; end_run "ok" ;;
-    --track)      run_track; end_run "ok" ;;
+    --track)      run_track; run_monitor; end_run "ok" ;;
     --report)     run_report; print_summary; end_run "ok" ;;
     --scorecard)  run_scorecard && run_report && print_summary && end_run "ok" ;;
     --optimize)   run_optimize; end_run "ok" ;;
@@ -464,6 +504,13 @@ case "$CMD" in
         echo "" >> "$LOGFILE"
         run_track
         echo "" >> "$LOGFILE"
+        run_monitor  # 每日监控
+        echo "" >> "$LOGFILE"
+        # 周四自动执行每周优化
+        if [ "$IS_THURSDAY" = "4" ]; then
+            run_weekly_optimize
+            echo "" >> "$LOGFILE"
+        fi
         run_report
         echo "" >> "$LOGFILE"
         print_summary
