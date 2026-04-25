@@ -249,12 +249,21 @@ python backtest_weak_to_strong.py
 **分步执行**：
 
 ```bash
+# 基础流程
 ./daily_run.sh --scan          # 仅扫描选股（默认当天）
 ./daily_run.sh --track         # 仅更新已有选股的跟踪状态
 ./daily_run.sh --report        # 仅生成跟踪报告
 ./daily_run.sh --scorecard     # 跟踪更新 + 成绩单
+
+# 参数优化
 ./daily_run.sh --optimize      # 参数优化（坐标下降法）
 ./daily_run.sh --walkforward   # Walk-Forward 验证（滚动训练/测试）
+
+# 自适应系统（新增）
+./daily_run.sh --monitor           # 每日监控（异常预警 + 环境感知）
+./daily_run.sh --weekly-optimize   # 每周四层优化（参数/评分/信号/环境）
+./daily_run.sh --adaptive          # 一键执行：监控 + 优化 + 状态查看
+./daily_run.sh --status            # 查看沙盒验证状态
 ```
 
 **单独调用 Python 模块**：
@@ -799,6 +808,127 @@ score = 0.35 × expectancy + 0.25 × win_rate + 0.20 × (1 - max_dd) + 0.10 × s
 | 默认回退 | 表中无记录时使用内置 DEFAULTS |
 | 可动态修改 | `strategy_config.py` 提供 set/set_batch 接口 |
 | 快照导出 | `export_snapshot()` 导出 JSON 便于复现 |
+
+## 完整参数说明
+
+### 命令行选项
+
+| 选项 | 说明 | 示例 |
+|------|------|------|
+| `--date YYYY-MM-DD` | 指定扫描日期 | `./daily_run.sh --date 2026-04-20 --scan` |
+| `--scan` | 仅扫描选股 | `./daily_run.sh --scan` |
+| `--track` | 仅更新跟踪状态 | `./daily_run.sh --track` |
+| `--report` | 仅生成跟踪报告 | `./daily_run.sh --report` |
+| `--scorecard` | 跟踪更新 + 成绩单 | `./daily_run.sh --scorecard` |
+| `--optimize` | 参数优化（坐标下降法） | `./daily_run.sh --optimize` |
+| `--walkforward` | Walk-Forward 验证 | `./daily_run.sh --walkforward` |
+| `--monitor` | 每日监控（异常预警） | `./daily_run.sh --monitor` |
+| `--weekly-optimize` | 每周四层优化 | `./daily_run.sh --weekly-optimize` |
+| `--adaptive` | 一键执行（监控+优化+状态） | `./daily_run.sh --adaptive` |
+| `--status` | 查看沙盒验证状态 | `./daily_run.sh --status` |
+
+### 入场参数（category: entry）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `first_wave_min_days` | 3 | 一波上涨最少连续天数 |
+| `first_wave_min_gain` | 0.15 | 一波上涨最低累计涨幅（15%） |
+| `consolidation_max_days` | 15 | 回调最长持续天数 |
+| `consolidation_max_drawdown` | 0.20 | 回调最大允许回撤（20%） |
+| `weak_strong_threshold` | 0.03 | 大阳反转所需最小涨幅（3%） |
+| `anomaly_amplitude` | 0.06 | 异动不跌所需最小振幅（6%） |
+| `sector_momentum_window` | 10 | 板块动量回看窗口（天） |
+| `sector_min_strength` | 0.05 | 板块强势判断阈值（5%） |
+
+### 出场参数（category: exit）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `stop_loss_buffer` | 0.02 | 止损安全边际（回调最低点再降2%） |
+| `trailing_stop_pct` | 0.08 | 移动止盈回撤阈值（8%） |
+| `trailing_min_gain` | 0.10 | 移动止盈最低盈利要求（10%） |
+| `max_hold_days` | 20 | 最大持仓天数 |
+
+### 评分参数（category: scoring）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `score_base` | 5 | 基础分 |
+| `score_wave_high` | 20 | 一波涨幅 > 30% 加分 |
+| `score_wave_med` | 10 | 一波涨幅 > 20% 加分 |
+| `score_shallow_dd` | 15 | 回调深度 < 8% 加分 |
+| `score_med_dd` | 10 | 回调深度 < 15% 加分 |
+| `score_strong_gain` | 15 | 当日涨幅 > 7% 加分 |
+| `score_med_gain` | 10 | 当日涨幅 > 5% 加分 |
+| `score_weak_gain` | 5 | 当日涨幅 > 3% 加分 |
+| `score_high_vol` | 10 | 量比 > 2x 加分 |
+| `score_med_vol` | 5 | 量比 > 1.5x 加分 |
+| `score_full_bull` | 10 | MA5 > MA10 > MA20 加分 |
+| `score_partial_bull` | 5 | MA5 > MA10 加分 |
+| `score_anomaly_bonus` | 10 | 异动不跌额外加分 |
+| `score_sector_strong` | 5 | 强势板块加分 |
+
+### 评分权重参数（category: score_weight）
+
+> 自适应系统动态调整，调整幅度限制在 ±20%
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `weight_wave_gain` | 1.0 | 波段涨幅评分权重系数 |
+| `weight_shallow_dd` | 1.0 | 浅回调评分权重系数 |
+| `weight_strong_gain` | 1.0 | 强势涨幅评分权重系数 |
+| `weight_volume` | 1.0 | 放量评分权重系数 |
+| `weight_ma_bull` | 1.0 | 多头排列评分权重系数 |
+| `weight_anomaly` | 1.0 | 异动信号额外权重 |
+| `weight_sector` | 1.0 | 板块动量权重 |
+| `weight_signal_bonus` | 1.0 | 信号类型加分权重 |
+
+### 环境参数（category: environment）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `activity_coefficient` | 1.0 | 当前环境活跃度系数 |
+| `bull_threshold` | 1.0 | 上升期活跃度 |
+| `range_threshold` | 0.7 | 震荡期活跃度 |
+| `bear_threshold` | 0.3 | 退潮期活跃度 |
+
+### 沙盒验证配置
+
+| 参数 | 值 | 说明 |
+|------|------|------|
+| `validation_window_weeks` | 3 | 滚动窗口验证周期（周） |
+| `min_validation_trades` | 10 | 最小验证交易数 |
+| `pass_expectancy_threshold` | 0.005 | 通过期望值阈值（0.5%） |
+| `pass_win_rate_threshold` | 50 | 通过胜率阈值 |
+| `fail_expectancy_threshold` | -0.02 | 失败期望值阈值（-2%） |
+| `fail_win_rate_threshold` | 40 | 失败胜率阈值 |
+| `improvement_threshold` | 0.002 | 相比基准提升阈值 |
+| `max_pending_days` | 21 | pending 状态最大天数 |
+
+### Critical 预警配置
+
+| 参数 | 值 | 说明 |
+|------|------|------|
+| `auto_disable_threshold` | -0.05 | 自动禁用信号的期望值阈值 |
+| `min_sample_for_critical` | 20 | Critical 判断最小样本数 |
+| `notification_methods` | ['log', 'print'] | 通知方式 |
+
+### 参数查看与修改
+
+```bash
+# 查看 Python 模块参数
+python strategy_config.py         # 显示当前参数
+python strategy_config.py --help  # 显示帮助
+
+# 查看自适应系统状态
+./daily_run.sh --status           # 查看沙盒验证状态
+
+# 手动修改参数（需通过数据库）
+# 参数存储在 stock_data.db 的 strategy_config 表中
+# 可通过 sqlite3 命令行或 Python API 修改
+```
+
+---
 
 ## 设计要点
 
