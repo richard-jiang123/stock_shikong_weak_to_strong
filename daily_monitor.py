@@ -281,8 +281,18 @@ class DailyMonitor:
                 """, (win_rate, avg_win, avg_loss, expectancy, expectancy_lb, len(pnls), signal_type))
 
     def _write_monitor_log(self, alerts, monitor_date):
-        """写入监控日志"""
+        """写入监控日志（每天只记录一次）"""
         with self.dl._get_conn() as conn:
+            # 检查今天是否已有日志记录
+            existing_count = conn.execute("""
+                SELECT COUNT(*) FROM daily_monitor_log
+                WHERE monitor_date=? AND action_taken='logged'
+            """, (monitor_date,)).fetchone()[0]
+
+            if existing_count > 0:
+                # 今天已有记录，不再追加
+                return
+
             for alert in alerts:
                 conn.execute("""
                     INSERT INTO daily_monitor_log

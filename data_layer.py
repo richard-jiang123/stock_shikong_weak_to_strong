@@ -202,6 +202,16 @@ class StockDataLayer:
                 )
             """)
 
+            # trading_day_cache 表：缓存交易日检查结果，避免重复 API 调用
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trading_day_cache (
+                    date TEXT PRIMARY KEY,
+                    is_trading_day INTEGER,
+                    checked_at TEXT,
+                    data_available INTEGER
+                )
+            """)
+
             # 初始化四种信号的默认状态
             from signal_constants import SIGNAL_TYPE_MAPPING
             for signal_type, display_name in SIGNAL_TYPE_MAPPING.items():
@@ -903,6 +913,34 @@ class StockDataLayer:
                 LIMIT 5
             """, (max_date,))
             sample = [r[0] for r in cur.fetchall()]
+
+            # 先检查缓存，避免重复 API 调用
+            cached = conn.execute("""
+                SELECT is_trading_day, data_available, checked_at
+                FROM trading_day_cache WHERE date=?
+            """, (target_date,)).fetchone()
+
+            if cached:
+                is_trading_day = cached[0]
+                data_available = cached[1]
+                checked_at = cached[2]
+                # 缓存有效条件：当天检查的，或者检查时间在收盘后（17:00后）
+                checked_dt = datetime.strptime(checked_at, '%Y-%m-%d %H:%M:%S')
+                is_same_day = checked_dt.strftime('%Y-%m-%d') == datetime.now().strftime('%Y-%m-%d')
+                is_checked_after_close = checked_dt.hour >= 17
+
+                if is_same_day or is_checked_after_close:
+                    # 使用缓存结果
+                    if is_trading_day == 0:
+                        # 非交易日
+                        return True, max_date, {'reason': 'non_trading_day', 'sample_checked': len(sample), 'incomplete_count': 0, 'cached': True}
+                    elif data_available == 1:
+                        # 交易日且数据可用 → 需要更新
+                        return False, max_date, {'reason': 'need_update', 'sample_checked': len(sample), 'incomplete_count': 0, 'cached': True}
+                    else:
+                        # 交易日但数据不可用
+                        return False, max_date, {'reason': 'data_not_updated', 'sample_checked': len(sample), 'incomplete_count': 0, 'cached': True}
+
         if len(sample) < 2:
             return False, max_date, {'reason': 'need_update', 'sample_checked': 0, 'incomplete_count': 0}
 
@@ -934,13 +972,14 @@ class StockDataLayer:
                           len(index_rs.get_data()) > 0)
 
         if has_target_data or index_has_data:
-            # 目标日期有数据 → 需要增量更新
+            # 目标日期有数据 → 交易日，数据可用 → 需要增量更新
+            self._cache_trading_day(target_date, is_trading_day=True, data_available=True)
             return False, max_date, {'reason': 'need_update', 'sample_checked': len(sample), 'incomplete_count': 0}
         elif api_error_count >= 3:
-            # API多次失败 → 数据源可能不可用，视为数据未更新
+            # API多次失败 → 数据源可能不可用，视为数据未更新（不缓存）
             return False, max_date, {'reason': 'data_not_updated', 'sample_checked': len(sample), 'incomplete_count': 0}
         elif is_early_after_close:
-            # 时间较早（17:00前），数据源可能未更新，视为数据未更新而非非交易日
+            # 时间较早（17:00前），数据源可能未更新，视为数据未更新而非非交易日（不缓存）
             return False, max_date, {'reason': 'data_not_updated', 'sample_checked': len(sample), 'incomplete_count': 0}
         else:
             # 目标日期无数据且API正常，时间较晚 → 非交易日
@@ -953,7 +992,18 @@ class StockDataLayer:
                 if max_date_cnt < 100:
                     # 最大日期数据不完整，需要重新批量更新
                     return False, max_date, {'reason': 'need_update', 'sample_checked': max_date_cnt, 'incomplete_count': 0}
+            # 缓存非交易日结果
+            self._cache_trading_day(target_date, is_trading_day=False, data_available=False)
             return True, max_date, {'reason': 'non_trading_day', 'sample_checked': len(sample), 'incomplete_count': 0}
+
+    def _cache_trading_day(self, date, is_trading_day, data_available):
+        """缓存交易日检查结果"""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO trading_day_cache
+                (date, is_trading_day, checked_at, data_available)
+                VALUES (?, ?, datetime('now'), ?)
+            """, (date, 1 if is_trading_day else 0, 1 if data_available else 0))
 
     def get_last_date(self, code):
         """获取某股票最后一条数据的日期"""
