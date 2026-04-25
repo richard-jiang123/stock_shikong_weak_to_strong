@@ -126,6 +126,8 @@ class PickTracker:
             picks_df: DataFrame from today_signals.csv or in-memory results.
                       Expected columns: code, signal, score, wave_gain, cons_dd,
                                         vol_ratio, entry, stop_loss, market_regime, index, name, reasons
+                      Also supports score_details columns: score_base, score_wave_gain, score_shallow_dd,
+                                        score_day_gain, score_volume, score_ma_bull, score_sector, score_signal_bonus
             pick_date: Date string 'YYYY-MM-DD', defaults to today
 
         Returns:
@@ -158,10 +160,22 @@ class PickTracker:
                 else:
                     code = code_str
 
+                # 获取评分明细字段（支持中文和英文表头）
+                score_base = float(row.get('score_base', row.get('评分基础', 5)))
+                score_wave_gain = float(row.get('score_wave_gain', row.get('评分波段', 0)))
+                score_shallow_dd = float(row.get('score_shallow_dd', row.get('评分回调', 0)))
+                score_day_gain = float(row.get('score_day_gain', row.get('评分涨幅', 0)))
+                score_volume = float(row.get('score_volume', row.get('评分放量', 0)))
+                score_ma_bull = float(row.get('score_ma_bull', row.get('评分多头', 0)))
+                score_sector = float(row.get('score_sector', row.get('评分板块', 0)))
+                score_signal_bonus = float(row.get('score_signal_bonus', row.get('评分信号', 0)))
+
                 conn.execute('''INSERT OR REPLACE INTO pick_tracking
                     (pick_date, code, signal_type, score, wave_gain, cons_dd, vol_ratio,
-                     entry_price, stop_loss, cons_low, market_regime, index_code, name, status)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'active')''',
+                     entry_price, stop_loss, cons_low, market_regime, index_code, name, status,
+                     score_base, score_wave_gain, score_shallow_dd, score_day_gain,
+                     score_volume, score_ma_bull, score_sector, score_signal_bonus)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?,?,?,?,?,?,?)''',
                     (pick_date, code,
                      row.get('信号', row.get('signal', '')),
                      float(row.get('评分', row.get('score', 0))),
@@ -173,7 +187,9 @@ class PickTracker:
                      float(row.get('cons_low', 0)),
                      row.get('市场环境', row.get('market_regime', '')),
                      row.get('指数', row.get('index', '')),
-                     row.get('名称', row.get('name', ''))))
+                     row.get('名称', row.get('name', '')),
+                     score_base, score_wave_gain, score_shallow_dd, score_day_gain,
+                     score_volume, score_ma_bull, score_sector, score_signal_bonus))
                 count += 1
         return count
 

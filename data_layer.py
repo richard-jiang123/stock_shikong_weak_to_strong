@@ -36,6 +36,7 @@ class StockDataLayer:
         self.db_path = db_path or DB_PATH
         self._init_db()
         self._create_adaptive_tables()  # 创建自适应系统表
+        self._migrate_adaptive_tables()  # 迁移缺失字段
 
     def _get_conn(self):
         conn = sqlite3.connect(self.db_path)
@@ -157,6 +158,7 @@ class StockDataLayer:
                     old_value REAL,
                     new_value REAL,
                     sandbox_test_result TEXT,
+                    weeks_passed INTEGER DEFAULT 0,
                     apply_date TEXT,
                     backtest_train_sharpe REAL,
                     backtest_oos_sharpe REAL,
@@ -207,6 +209,15 @@ class StockDataLayer:
                     INSERT OR IGNORE INTO signal_status (signal_type, display_name, status_level, weight_multiplier)
                     VALUES (?, ?, 'active', 1.0)
                 """, (signal_type, display_name))
+
+    def _migrate_adaptive_tables(self):
+        """迁移：为现有自适应表添加缺失字段"""
+        with self._get_conn() as conn:
+            # 检查 optimization_history 是否缺少 weeks_passed
+            cols = [c[1] for c in conn.execute("PRAGMA table_info(optimization_history)").fetchall()]
+            if 'weeks_passed' not in cols:
+                conn.execute("ALTER TABLE optimization_history ADD COLUMN weeks_passed INTEGER DEFAULT 0")
+                print("  迁移: optimization_history 添加 weeks_passed 字段")
 
     def update_stock_list(self):
         """更新股票列表，失败时回退到本地缓存。假设 baostock 已登录。"""

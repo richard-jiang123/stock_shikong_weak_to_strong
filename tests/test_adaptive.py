@@ -246,5 +246,88 @@ class TestDailyMonitor(unittest.TestCase):
         self.assertLess(result_5, result_50)
 
 
+class TestWeeklyOptimizer(unittest.TestCase):
+    """测试每周优化模块"""
+
+    def test_adjust_score_weight_positive_correlation(self):
+        """测试：正相关增加权重"""
+        from weekly_optimizer import adjust_score_weight
+
+        # 强正相关 → 加权
+        result = adjust_score_weight(1.0, 0.4)
+        self.assertGreater(result, 1.0)
+        # 调整幅度不超过20%
+        self.assertLessEqual(result, 1.2)
+
+    def test_adjust_score_weight_negative_correlation(self):
+        """测试：负相关减少权重"""
+        from weekly_optimizer import adjust_score_weight
+
+        # 负相关 → 减权
+        result = adjust_score_weight(1.0, -0.3)
+        self.assertLess(result, 1.0)
+        # 调整幅度不超过20%
+        self.assertGreaterEqual(result, 0.8)
+
+    def test_adjust_score_weight_weak_correlation(self):
+        """测试：弱相关保持不变"""
+        from weekly_optimizer import adjust_score_weight
+
+        # 弱相关 → 保持不变
+        result = adjust_score_weight(1.0, 0.1)
+        self.assertEqual(result, 1.0)
+
+    def test_weekly_optimizer_init(self):
+        """测试：WeeklyOptimizer 初始化"""
+        from weekly_optimizer import WeeklyOptimizer
+        optimizer = WeeklyOptimizer()
+        self.assertIsNotNone(optimizer.dl)
+        self.assertIsNotNone(optimizer.cfg)
+        self.assertIsNotNone(optimizer.optimizer)
+
+
+class TestSandboxValidator(unittest.TestCase):
+    """测试沙盒验证模块"""
+
+    def test_sandbox_config_exists(self):
+        """测试：沙盒配置存在"""
+        from sandbox_validator import SANDBOX_VALIDATION_CONFIG
+        self.assertIn('validation_window_weeks', SANDBOX_VALIDATION_CONFIG)
+        self.assertEqual(SANDBOX_VALIDATION_CONFIG['validation_window_weeks'], 3)
+
+    def test_sandbox_validator_init(self):
+        """测试：SandboxValidator 初始化"""
+        from sandbox_validator import SandboxValidator
+        validator = SandboxValidator()
+        self.assertIsNotNone(validator.dl)
+        self.assertIsNotNone(validator.cfg)
+
+    def test_status_values_defined(self):
+        """测试：状态值定义"""
+        from sandbox_validator import SANDBOX_VALIDATION_CONFIG
+        from signal_constants import SANDBOX_STATUS
+        self.assertEqual(SANDBOX_VALIDATION_CONFIG['status_values'], SANDBOX_STATUS)
+
+
+class TestAdaptiveEngine(unittest.TestCase):
+    """测试自适应引擎"""
+
+    def test_adaptive_engine_init(self):
+        """测试：AdaptiveEngine 初始化"""
+        from adaptive_engine import AdaptiveEngine
+        engine = AdaptiveEngine()
+        self.assertIsNotNone(engine.dl)
+        self.assertIsNotNone(engine.cfg)
+        self.assertIsNotNone(engine.monitor)
+        self.assertIsNotNone(engine.weekly_optimizer)
+        self.assertIsNotNone(engine.sandbox_validator)
+
+    def test_critical_config_defined(self):
+        """测试：critical配置定义"""
+        from adaptive_engine import AdaptiveEngine
+        self.assertIn('auto_disable_threshold', AdaptiveEngine.CRITICAL_CONFIG)
+        self.assertIn('min_sample_for_critical', AdaptiveEngine.CRITICAL_CONFIG)
+
+
 if __name__ == '__main__':
     unittest.main()

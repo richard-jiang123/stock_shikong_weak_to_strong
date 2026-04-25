@@ -68,24 +68,60 @@ def detect_pattern(df):
     elif df.iloc[ti-1]['pct_chg'] > 0.08 and df.iloc[ti-1]['close'] < df.iloc[ti-1]['high']*0.97 and tp > 0.02:
         sig = '烂板次日'
     if not sig: return None
-    # === 评分 ===
-    sc = 5; reasons = []
-    if wg > 0.30: sc += 20; reasons.append(f"一波{wg*100:.0f}%")
-    elif wg > 0.20: sc += 10; reasons.append(f"一波{wg*100:.0f}%")
-    if dd < 0.08: sc += 15; reasons.append(f"浅调{dd*100:.0f}%")
-    elif dd < 0.15: sc += 10; reasons.append(f"调{dd*100:.0f}%")
-    if tp > 0.07: sc += 15
-    elif tp > 0.05: sc += 10
-    elif tp > 0.03: sc += 5
+    # === 评分（拆分为 score_details）===
+    score_base = 5
+    score_wave_gain = 0
+    score_shallow_dd = 0
+    score_day_gain = 0
+    score_volume = 0
+    score_ma_bull = 0
+    score_signal_bonus = 0
+    reasons = []
+
+    # 波段涨幅评分
+    if wg > 0.30: score_wave_gain = 20; reasons.append(f"一波{wg*100:.0f}%")
+    elif wg > 0.20: score_wave_gain = 10; reasons.append(f"一波{wg*100:.0f}%")
+
+    # 回调深度评分
+    if dd < 0.08: score_shallow_dd = 15; reasons.append(f"浅调{dd*100:.0f}%")
+    elif dd < 0.15: score_shallow_dd = 10; reasons.append(f"调{dd*100:.0f}%")
+
+    # 当日涨幅评分
+    if tp > 0.07: score_day_gain = 15
+    elif tp > 0.05: score_day_gain = 10
+    elif tp > 0.03: score_day_gain = 5
+
+    # 放量评分
     vr = df.iloc[ti]['volume'] / max(df.iloc[ti]['volume_ma5'], 1)
-    if vr > 2: sc += 10; reasons.append(f"放量{vr:.1f}x")
-    elif vr > 1.5: sc += 5
-    if df.iloc[ti]['ma5'] > df.iloc[ti]['ma10'] > df.iloc[ti]['ma20']: sc += 10; reasons.append("多头")
-    elif df.iloc[ti]['ma5'] > df.iloc[ti]['ma10']: sc += 5
-    if sig == '异动不跌': sc += 10
-    return {'sig': sig, 'score': sc, 'reasons': ' | '.join(reasons),
-            'wg': wg, 'dd': dd, 'tp': tp, 'vr': vr,
-            'sl': mn*0.98, 'ep': df.iloc[ti]['close'], 'cons_low': mn}
+    if vr > 2: score_volume = 10; reasons.append(f"放量{vr:.1f}x")
+    elif vr > 1.5: score_volume = 5
+
+    # 多头排列评分
+    if df.iloc[ti]['ma5'] > df.iloc[ti]['ma10'] > df.iloc[ti]['ma20']: score_ma_bull = 10; reasons.append("多头")
+    elif df.iloc[ti]['ma5'] > df.iloc[ti]['ma10']: score_ma_bull = 5
+
+    # 异动信号额外加分
+    if sig == '异动不跌': score_signal_bonus = 10
+
+    # 计算总评分
+    total_score = score_base + score_wave_gain + score_shallow_dd + score_day_gain + score_volume + score_ma_bull + score_signal_bonus
+
+    return {
+        'sig': sig,
+        'score': total_score,
+        'score_details': {
+            'score_base': score_base,
+            'score_wave_gain': score_wave_gain,
+            'score_shallow_dd': score_shallow_dd,
+            'score_day_gain': score_day_gain,
+            'score_volume': score_volume,
+            'score_ma_bull': score_ma_bull,
+            'score_signal_bonus': score_signal_bonus,
+        },
+        'reasons': ' | '.join(reasons),
+        'wg': wg, 'dd': dd, 'tp': tp, 'vr': vr,
+        'sl': mn*0.98, 'ep': df.iloc[ti]['close'], 'cons_low': mn
+    }
 
 
 def _find_latest_complete_date(dl, min_stocks=100):
@@ -211,11 +247,14 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
             sector_info = sector_momentum_cache.get(industry, {'momentum': 0, 'strong': False})
             sector_strong = sector_info['strong']
 
+            # 获取评分明细
+            score_details = r.get('score_details', {})
+            score_sector = 5 if sector_strong else 0
+
             # 添加板块动量评分
-            score = r['score']
+            score = r['score'] + score_sector
             reasons = r['reasons']
             if sector_strong:
-                score += 5  # 强势板块加分
                 if reasons:
                     reasons = reasons + ' | 强势板块'
                 else:
@@ -234,6 +273,15 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
                 '行业': industry,
                 '板块强势': sector_strong,
                 '原因': reasons,
+                # 评分明细字段
+                'score_base': score_details.get('score_base', 5),
+                'score_wave_gain': score_details.get('score_wave_gain', 0),
+                'score_shallow_dd': score_details.get('score_shallow_dd', 0),
+                'score_day_gain': score_details.get('score_day_gain', 0),
+                'score_volume': score_details.get('score_volume', 0),
+                'score_ma_bull': score_details.get('score_ma_bull', 0),
+                'score_sector': score_sector,
+                'score_signal_bonus': score_details.get('score_signal_bonus', 0),
             })
         if verbose and ((i+1) % 500 == 0 or i + 1 == len(filtered_codes)):
             print(f"  扫描 {i+1}/{len(filtered_codes)} | 命中 {len(results)}")

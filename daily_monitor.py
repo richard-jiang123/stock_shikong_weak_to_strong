@@ -137,8 +137,8 @@ class DailyMonitor:
 
     def _check_market_regime(self, monitor_date):
         """检查市场环境"""
-        # 获取上证指数数据
-        index_data = self.dl.get_kline('sh.000001',
+        # 获取上证指数数据（使用 get_index_kline 查询 index_daily 表）
+        index_data = self.dl.get_index_kline('sh.000001',
             start_date=(datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
             end_date=monitor_date
         )
@@ -148,8 +148,8 @@ class DailyMonitor:
 
         regime, coeff, consecutive = self._get_market_regime_smoothed(index_data)
 
-        # 更新 market_regime 表
-        self._update_market_regime_table(monitor_date, regime, coeff, consecutive)
+        # 更新 market_regime 表（传递 index_data 避免重复查询）
+        self._update_market_regime_table(monitor_date, regime, coeff, consecutive, index_data)
 
         if regime == 'bear' and consecutive >= 5:
             return {
@@ -230,11 +230,8 @@ class DailyMonitor:
             """).fetchone()
             return row[0] if row else None
 
-    def _update_market_regime_table(self, date, regime, coeff, consecutive):
+    def _update_market_regime_table(self, date, regime, coeff, consecutive, index_data=None):
         """更新 market_regime 表"""
-        index_data = self.dl.get_kline('sh.000001',
-            start_date=date, end_date=date
-        )
         if index_data is None or len(index_data) == 0:
             return
 

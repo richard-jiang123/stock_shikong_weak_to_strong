@@ -11,6 +11,9 @@
 #   ./daily_run.sh --optimize         # 参数优化（坐标下降）
 #   ./daily_run.sh --walkforward      # Walk-Forward 验证
 #   ./daily_run.sh --scorecard        # 跟踪 + 报告（不扫描）
+#   ./daily_run.sh --monitor          # 每日监控（异常检测）
+#   ./daily_run.sh --weekly-optimize  # 每周四层优化
+#   ./daily_run.sh --adaptive         # 完整自适应流程（监控 + 优化）
 #
 # 建议配合 cron 每天收盘后运行:
 #   0 16 * * 1-5 /path/to/daily_run.sh
@@ -414,6 +417,33 @@ run_walkforward() {
     log "─────────── Walk-Forward 完成 ────────────"
 }
 
+run_monitor() {
+    log "─────────────── 每日监控 ───────────────"
+    $PY adaptive_engine.py --mode daily ${SCAN_DATE:+--date $SCAN_DATE} 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件
+    done
+    log "────────────── 监控完成 ────────────────"
+}
+
+run_weekly_optimize() {
+    log "─────────────── 每周优化 ───────────────"
+    $PY adaptive_engine.py --mode weekly ${SCAN_DATE:+--date $SCAN_DATE} 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件
+    done
+    log "────────────── 优化完成 ────────────────"
+}
+
+run_adaptive_status() {
+    log "─────────────── 自适应状态 ───────────────"
+    $PY adaptive_engine.py --mode status 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"  # 终端显示
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"  # 日志文件
+    done
+    log "────────────── 状态查询完成 ───────────────"
+}
+
 # ── Main ──
 start_run
 
@@ -425,6 +455,10 @@ case "$CMD" in
     --scorecard)  run_scorecard && run_report && print_summary && end_run "ok" ;;
     --optimize)   run_optimize; end_run "ok" ;;
     --walkforward) run_walkforward; end_run "ok" ;;
+    --monitor)    run_monitor; end_run "ok" ;;
+    --weekly-optimize) run_weekly_optimize; end_run "ok" ;;
+    --adaptive)   run_monitor && run_weekly_optimize && run_adaptive_status; end_run "ok" ;;
+    --status)     run_adaptive_status; end_run "ok" ;;
     all|"")
         run_scan
         echo "" >> "$LOGFILE"
@@ -436,7 +470,7 @@ case "$CMD" in
         end_run "ok"
         ;;
     *)
-        echo "用法: $0 [--date YYYY-MM-DD] [--scan|--track|--report|--scorecard|--optimize|--walkforward|all]"
+        echo "用法: $0 [--date YYYY-MM-DD] [--scan|--track|--report|--scorecard|--optimize|--walkforward|--monitor|--weekly-optimize|--adaptive|--status|all]"
         end_run "fail"
         exit 1
         ;;
