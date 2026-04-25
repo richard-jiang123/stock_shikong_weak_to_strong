@@ -36,6 +36,7 @@ class PickTracker:
         self.dl = get_data_layer()
         self.cfg = StrategyConfig(self.db_path)
         self._ensure_tables()
+        self._migrate_pick_tracking_scores()
 
     def _get_conn(self):
         conn = sqlite3.connect(self.db_path)
@@ -69,6 +70,14 @@ class PickTracker:
                 final_pnl_pct REAL,
                 max_pnl_pct   REAL,
                 max_dd_pct    REAL,
+                score_wave_gain REAL,
+                score_shallow_dd REAL,
+                score_day_gain REAL,
+                score_volume REAL,
+                score_ma_bull REAL,
+                score_sector REAL,
+                score_signal_bonus REAL,
+                score_base REAL DEFAULT 5,
                 created_at    TEXT DEFAULT (datetime('now')),
                 UNIQUE(pick_date, code)
             )''')
@@ -85,6 +94,26 @@ class PickTracker:
                 sample_size  INTEGER,
                 UNIQUE(report_date, metric_key)
             )''')
+
+    def _migrate_pick_tracking_scores(self):
+        """迁移：为现有 pick_tracking 表添加评分字段"""
+        columns = self._get_conn().execute("PRAGMA table_info(pick_tracking)").fetchall()
+        col_names = [c[1] for c in columns]
+
+        migrations = [
+            ('score_wave_gain', 'REAL'),
+            ('score_shallow_dd', 'REAL'),
+            ('score_day_gain', 'REAL'),
+            ('score_volume', 'REAL'),
+            ('score_ma_bull', 'REAL'),
+            ('score_sector', 'REAL'),
+            ('score_signal_bonus', 'REAL'),
+            ('score_base', 'REAL DEFAULT 5'),
+        ]
+
+        for col_name, col_type in migrations:
+            if col_name not in col_names:
+                self._get_conn().execute(f"ALTER TABLE pick_tracking ADD COLUMN {col_name} {col_type}")
 
     # ── Record picks ──────────────────────────────────────────────
 

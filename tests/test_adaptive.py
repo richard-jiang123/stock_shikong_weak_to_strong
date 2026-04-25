@@ -117,5 +117,42 @@ class TestDatabaseTables(unittest.TestCase):
         self.assertEqual(len(tables), 1)
 
 
+class TestPickTrackingScoreFields(unittest.TestCase):
+    """测试 pick_tracking 评分字段"""
+
+    def setUp(self):
+        """测试前准备"""
+        import tempfile
+        self.temp_file = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.db_path = self.temp_file.name
+        self.temp_file.close()
+
+    def tearDown(self):
+        """测试后清理"""
+        import os
+        try:
+            os.unlink(self.db_path)
+        except:
+            pass
+
+    def test_pick_tracking_has_score_fields(self):
+        """测试：pick_tracking表有评分字段"""
+        from pick_tracker import PickTracker
+        tracker = PickTracker(self.db_path)
+
+        columns = tracker._get_conn().execute("PRAGMA table_info(pick_tracking)").fetchall()
+        col_names = [c[1] for c in columns]
+
+        # 检查评分字段存在
+        self.assertIn('score_wave_gain', col_names)
+        self.assertIn('score_shallow_dd', col_names)
+        self.assertIn('score_day_gain', col_names)
+        self.assertIn('score_volume', col_names)
+        self.assertIn('score_ma_bull', col_names)
+        self.assertIn('score_sector', col_names)
+        self.assertIn('score_signal_bonus', col_names)
+        self.assertIn('score_base', col_names)
+
+
 if __name__ == '__main__':
     unittest.main()
