@@ -54,13 +54,67 @@ class TestDatabaseTables(unittest.TestCase):
     def setUp(self):
         """测试前准备"""
         import sqlite3
-        # 使用临时数据库
-        self.db_path = ':memory:'
+        import tempfile
+        import os
+        # 使用临时文件数据库（:memory: 每个连接独立）
+        self.temp_file = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.db_path = self.temp_file.name
+        self.temp_file.close()
         self.conn = sqlite3.connect(self.db_path)
 
     def tearDown(self):
         """测试后清理"""
         self.conn.close()
+        import os
+        try:
+            os.unlink(self.db_path)
+        except:
+            pass
+
+    def test_create_signal_status_table(self):
+        """测试：signal_status表创建"""
+        from data_layer import StockDataLayer
+        dl = StockDataLayer(self.db_path)
+        dl._create_adaptive_tables()
+
+        # 检查表存在
+        tables = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='signal_status'"
+        ).fetchall()
+        self.assertEqual(len(tables), 1)
+
+    def test_create_optimization_history_table(self):
+        """测试：optimization_history表创建"""
+        from data_layer import StockDataLayer
+        dl = StockDataLayer(self.db_path)
+        dl._create_adaptive_tables()
+
+        tables = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='optimization_history'"
+        ).fetchall()
+        self.assertEqual(len(tables), 1)
+
+    def test_create_market_regime_table(self):
+        """测试：market_regime表创建"""
+        from data_layer import StockDataLayer
+        dl = StockDataLayer(self.db_path)
+        dl._create_adaptive_tables()
+
+        tables = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='market_regime'"
+        ).fetchall()
+        self.assertEqual(len(tables), 1)
+
+    def test_create_daily_monitor_log_table(self):
+        """测试：daily_monitor_log表创建"""
+        from data_layer import StockDataLayer
+        dl = StockDataLayer(self.db_path)
+        dl._create_adaptive_tables()
+
+        tables = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='daily_monitor_log'"
+        ).fetchall()
+        self.assertEqual(len(tables), 1)
 
 
 if __name__ == '__main__':

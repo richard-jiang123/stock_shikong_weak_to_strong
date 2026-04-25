@@ -35,6 +35,7 @@ class StockDataLayer:
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_PATH
         self._init_db()
+        self._create_adaptive_tables()  # 创建自适应系统表
 
     def _get_conn(self):
         conn = sqlite3.connect(self.db_path)
@@ -119,6 +120,93 @@ class StockDataLayer:
                 conn.execute("ALTER TABLE stock_meta ADD COLUMN industry TEXT")
             except sqlite3.OperationalError:
                 pass  # 字段已存在
+
+    def _create_adaptive_tables(self):
+        """创建自适应系统所需的新表"""
+
+        with self._get_conn() as conn:
+            # signal_status 表
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS signal_status (
+                    signal_type TEXT PRIMARY KEY,
+                    display_name TEXT,
+                    status_level TEXT DEFAULT 'active',
+                    weight_multiplier REAL DEFAULT 1.0,
+                    live_win_rate REAL,
+                    live_avg_win_pct REAL,
+                    live_avg_loss_pct REAL,
+                    live_expectancy REAL,
+                    live_expectancy_lb REAL,
+                    live_sample_count INTEGER DEFAULT 0,
+                    live_observation_weeks INTEGER DEFAULT 0,
+                    confidence_level TEXT DEFAULT 'unknown',
+                    min_sample_threshold INTEGER DEFAULT 10,
+                    last_check_date TEXT,
+                    disable_reason TEXT,
+                    can_auto_disable INTEGER DEFAULT 0
+                )
+            """)
+
+            # optimization_history 表
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS optimization_history (
+                    id INTEGER PRIMARY KEY,
+                    optimize_date TEXT,
+                    optimize_type TEXT,
+                    param_key TEXT,
+                    old_value REAL,
+                    new_value REAL,
+                    sandbox_test_result TEXT,
+                    apply_date TEXT,
+                    backtest_train_sharpe REAL,
+                    backtest_oos_sharpe REAL,
+                    backtest_win_rate REAL,
+                    backtest_expectancy REAL,
+                    live_win_rate REAL,
+                    live_expectancy REAL,
+                    rollback_needed INTEGER DEFAULT 0,
+                    rollback_date TEXT,
+                    validation_started_at TEXT,
+                    created_at TEXT
+                )
+            """)
+
+            # market_regime 表
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS market_regime (
+                    id INTEGER PRIMARY KEY,
+                    regime_date TEXT NOT NULL,
+                    regime_type TEXT,
+                    activity_coefficient REAL,
+                    index_close REAL,
+                    index_ma5 REAL,
+                    index_ma20 REAL,
+                    consecutive_days INTEGER,
+                    created_at TEXT,
+                    UNIQUE(regime_date)
+                )
+            """)
+
+            # daily_monitor_log 表
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_monitor_log (
+                    id INTEGER PRIMARY KEY,
+                    monitor_date TEXT,
+                    alert_type TEXT,
+                    alert_detail TEXT,
+                    severity TEXT,
+                    action_taken TEXT,
+                    created_at TEXT
+                )
+            """)
+
+            # 初始化四种信号的默认状态
+            from signal_constants import SIGNAL_TYPE_MAPPING
+            for signal_type, display_name in SIGNAL_TYPE_MAPPING.items():
+                conn.execute("""
+                    INSERT OR IGNORE INTO signal_status (signal_type, display_name, status_level, weight_multiplier)
+                    VALUES (?, ?, 'active', 1.0)
+                """, (signal_type, display_name))
 
     def update_stock_list(self):
         """更新股票列表，失败时回退到本地缓存。假设 baostock 已登录。"""
