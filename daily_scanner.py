@@ -11,6 +11,7 @@ import sys
 import os
 import argparse
 import warnings
+import unicodedata
 warnings = __import__('warnings'); warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -120,11 +121,16 @@ def _get_real_prev_trading_date(target_date=None):
 
 
 def _signals_filepath(script_dir, date_str):
-    """Build dated CSV file path: YYYYMMDD_today_signals.csv"""
-    return os.path.join(script_dir, date_str.replace('-', '') + '_today_signals.csv')
+    """Build dated XLSX file path: YYYYMMDD_today_signals.xlsx"""
+    return os.path.join(script_dir, date_str.replace('-', '') + '_today_signals.xlsx')
 
 
-def _scan_core(dl, codes, regime_cache, name_map, start_date, end_date, verbose=True):
+def _get_industry_map(dl):
+    """从数据库获取股票行业分类"""
+    return dl.get_industry_map()
+
+
+def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_date, verbose=True):
     """
     Run pattern scan for data up to end_date. Returns list of result dicts.
     Optimized: batch load data first, then fast iteration.
@@ -148,30 +154,72 @@ def _scan_core(dl, codes, regime_cache, name_map, start_date, end_date, verbose=
             last = df.iloc[-1]
             index_code = dl.code_to_index(code).split('.')[1]
             results.append({
-                'code': code.split('.')[1], 'name': name_map.get(code, ''),
-                'close': last['close'],
-                'pct_chg': last['pct_chg'], 'signal': r['sig'],
-                'score': r['score'], 'wave_gain': r['wg'],
-                'cons_dd': r['dd'], 'vol_ratio': r['vr'],
-                'stop_loss': r['sl'], 'entry': r['ep'],
-                'index': index_code,
-                'market_regime': {'bull': '上升期', 'range': '震荡期', 'bear': '退潮期'}.get(
+                '代码': code.split('.')[1], '名称': name_map.get(code, ''),
+                '现价': last['close'],
+                '涨幅': last['pct_chg'], '信号': r['sig'],
+                '评分': r['score'], '波段涨幅': r['wg'],
+                '回调': r['dd'], '量比': r['vr'],
+                '止损位': r['sl'], '入场价': r['ep'],
+                '指数': index_code,
+                '市场环境': {'bull': '上升期', 'range': '震荡期', 'bear': '退潮期'}.get(
                     regime_cache.get(dl.code_to_index(code), 'range'), '震荡期'),
-                'reasons': r['reasons'],
+                '行业': industry_map.get(code, ''),
+                '原因': r['reasons'],
             })
         if verbose and ((i+1) % 500 == 0 or i + 1 == len(filtered_codes)):
             print(f"  扫描 {i+1}/{len(filtered_codes)} | 命中 {len(results)}")
             sys.stdout.flush()
 
-    results.sort(key=lambda x: x['score'], reverse=True)
+    results.sort(key=lambda x: x['评分'], reverse=True)
     return results
 
 
+def _display_width(s):
+    """计算字符串在等宽字体终端下的显示宽度"""
+    width = 0
+    for ch in s:
+        if ch == '\t':
+            width += 8 - (width % 8)   # 简单处理制表符
+        else:
+            # East Asian Width 为 W 或 F 的字符占2个宽度
+            ea = unicodedata.east_asian_width(ch)
+            width += 2 if ea in ('W', 'F') else 1
+    return width
+
+def _pad_str(s, width, align='<'):
+    """将字符串 s 填充到给定显示宽度"""
+    cur = _display_width(s)
+    if cur >= width:
+        return s
+    pad = width - cur
+    if align == '<':
+        return s + ' ' * pad
+    elif align == '>':
+        return ' ' * pad + s
+    else:   # '^'
+        left = pad // 2
+        return ' ' * left + s + ' ' * (pad - left)
+
+# ANSI 颜色代码
+RED = '\033[91m'    # 红色（正值/涨幅）
+GREEN = '\033[92m'  # 绿色（负值/跌幅）
+RESET = '\033[0m'   # 重置颜色
+
+def _color_pct(value, suffix='%'):
+    """根据正负值返回带颜色的百分比字符串"""
+    if value > 0:
+        return f"{RED}{value:+.1f}{suffix}{RESET}"
+    elif value < 0:
+        return f"{GREEN}{value:+.1f}{suffix}{RESET}"
+    else:
+        return f"{value:.1f}{suffix}"
+
 def _print_results(results, scan_elapsed, prev_codes, verbose=True):
     """Print scan results and compare with previous day's picks."""
-    # Compare with previous picks
+    # 标记是否新增
     for r in results:
-        r['是否新增'] = '是' if (prev_codes is not None and r['code'] not in prev_codes) else '否'
+        r['是否新增'] = '是' if (prev_codes is not None and r['代码'] not in prev_codes) else '否'
+
     if prev_codes is None:
         new_count = len(results)
         repeat_count = 0
@@ -189,42 +237,105 @@ def _print_results(results, scan_elapsed, prev_codes, verbose=True):
         print("\n当日无弱转强信号")
         return
 
-    # 中文表头，使用固定宽度对齐
-    print()
-    # 中文名称截取前4字符保持对齐
-    print(" #   代码    名称      现价      涨幅    信号       评分  回调  新增")
-    print("-" * 78)
-    for i, c in enumerate(results[:20]):
-        tag = '★' if c['是否新增'] == '是' else ' '
-        code_str = str(c['code'])
-        if '.' in code_str:
-            code_str = code_str.split('.')[1]
-        signal = c['signal']
-        name = c.get('name', '')
-        # 名称截取前4字符
-        name_str = name[:4]
-        print(f"{i+1:>2}   {code_str:<6}  {name_str:<8}  {c['close']:>8.2f}  {c['pct_chg']*100:>6.1f}%  {signal:<10}  {c['score']:>3}   {c['cons_dd']*100:>4.0f}%  {tag}")
+    # ---------- 表格列宽定义 (显示宽度) ----------
+    COL_WIDTHS = {
+        'idx': 3,       # 序号
+        'code': 7,      # 代码
+        'name': 10,     # 名称 (截取前4个字符)
+        'close': 8,     # 现价
+        'pct': 8,       # 涨幅(含%)
+        'cons_dd': 8,   # 回调幅度(含%)
+        'industry': 18, # 行业
+        'score': 5,     # 评分
+        'signal': 8,    # 信号
+        'tag': 3,       # 是否新增标记
+    }
+    SEP = '  '         # 列间隔
 
+    # 打印表头
+    headers = [
+        _pad_str(" #", COL_WIDTHS['idx'], '<'),
+        _pad_str("代码", COL_WIDTHS['code'], '<'),
+        _pad_str("名称", COL_WIDTHS['name'], '<'),
+        _pad_str("现价", COL_WIDTHS['close'], '>'),
+        _pad_str("涨幅", COL_WIDTHS['pct'], '>'),
+        _pad_str("回调", COL_WIDTHS['cons_dd'], '>'),
+        _pad_str("行业", COL_WIDTHS['industry'], '<'),
+        _pad_str("评分", COL_WIDTHS['score'], '>'),
+        _pad_str("信号", COL_WIDTHS['signal'], '<'),
+        _pad_str("新增", COL_WIDTHS['tag'], '<'),
+    ]
+    print()
+    print(SEP.join(headers))
+    print('-' * (sum(COL_WIDTHS.values()) + len(SEP) * (len(COL_WIDTHS) - 1)))
+
+    # 数据行 (最多20条)
+    for i, c in enumerate(results[:20]):
+        # 标记：★ 占2宽度，空格补足为两个空格以保证列宽一致
+        tag = '★' if c['是否新增'] == '是' else '  '
+
+        code_str = str(c['代码'])
+
+        name_str = c.get('名称', '')[:4]   # 截取前4字符
+
+        # 行业：取第一项（按顿号分隔）
+        industry = c.get('行业', '')
+        parts = industry.split('、')
+        industry_str = parts[0].strip() if parts else industry
+
+        # 构建各字段（对齐后）
+        idx_str = _pad_str(f"{i+1:>2}", COL_WIDTHS['idx'], '>')
+        code_str = _pad_str(code_str, COL_WIDTHS['code'], '<')
+        name_str = _pad_str(name_str, COL_WIDTHS['name'], '<')
+        close_str = _pad_str(f"{c['现价']:.2f}", COL_WIDTHS['close'], '>')
+
+        # 涨幅直接构建带颜色的版本，pad() 会根据 display_width 正确计算填充（忽略 ANSI 码）
+        pct_val = c['涨幅'] * 100
+        pct_colored = _color_pct(pct_val)
+        pct_str = _pad_str(pct_colored, COL_WIDTHS['pct'], '>')
+
+        cons_dd_str = _pad_str(f"{c['回调']*100:.1f}%", COL_WIDTHS['cons_dd'], '>')
+        industry_str = _pad_str(industry_str, COL_WIDTHS['industry'], '<')
+        score_str = _pad_str(f"{c['评分']}", COL_WIDTHS['score'], '>')
+        signal_str = _pad_str(c['信号'], COL_WIDTHS['signal'], '<')
+
+        row = SEP.join([
+            idx_str, code_str, name_str, close_str,
+            pct_str, cons_dd_str, industry_str, score_str, signal_str, tag
+        ])
+        print(row)
+
+    # 详细分析部分（无需严格对齐列，保留原样即可）
     print()
     print("=" * 52)
     print("TOP 10 详细分析")
     print("=" * 52)
     print()
     for i, c in enumerate(results[:10]):
-        tag = '[新增]' if c['是否新增'] == '是' else '[延续]'
-        if prev_codes is None:
+        if c['是否新增'] == '是':
+            tag = '[新增]'
+        elif prev_codes is None:
             tag = '[首次]'
-        code_str = str(c['code'])
-        if '.' in code_str:
-            code_str = code_str.split('.')[1]
-        name = c.get('name', '')
-        print(f"  {i+1:>2}. {code_str} {name} {tag}")
-        print(f"      现价: {c['close']:.2f} | 涨幅: {c['pct_chg']*100:+.1f}%")
-        print(f"      信号: {c['signal']} | 评分: {c['score']}")
-        print(f"      波段涨幅: {c['wave_gain']*100:.0f}% | 回调幅度: {c['cons_dd']*100:.0f}% | 量比: {c['vol_ratio']:.1f}x")
-        print(f"      止损位: {c['stop_loss']:.2f}")
-        if c.get('reasons'):
-            print(f"      原因: {c['reasons']}")
+        else:
+            tag = '[延续]'
+
+        code_str = str(c['代码'])
+        name = c.get('名称', '')
+        industry = c.get('行业', '')
+        parts = industry.split('、')
+        ind_display = parts[0].strip() if parts else industry
+
+        # 涨幅带颜色
+        pct_val = c['涨幅'] * 100
+        pct_colored = _color_pct(pct_val)
+
+        print(f"  {i+1:>2}. {code_str} {name} {tag} [{ind_display}]")
+        print(f"      现价: {c['现价']:.2f} | 涨幅: {pct_colored}")
+        print(f"      信号: {c['信号']} | 评分: {c['评分']}")
+        print(f"      波段涨幅: {c['波段涨幅']*100:.0f}% | 回调幅度: {c['回调']*100:.0f}% | 量比: {c['量比']:.1f}x")
+        print(f"      止损位: {c['止损位']:.2f}")
+        if c.get('原因'):
+            print(f"      原因: {c['原因']}")
         print()
 
     if prev_codes is None:
@@ -234,31 +345,38 @@ def _print_results(results, scan_elapsed, prev_codes, verbose=True):
     print()
 
 
-def _load_prev_csv(filepath):
-    """Load stock codes from previous day's CSV file. Returns set or None."""
+def _load_prev_file(filepath):
+    """Load stock codes from previous day's file (CSV or XLSX). Returns set or None."""
     try:
         if not os.path.exists(filepath):
             return None
-        df = pd.read_csv(filepath)
-        if 'code' not in df.columns:
+        # 兼容 CSV 和 XLSX 格式
+        if filepath.endswith('.xlsx'):
+            df = pd.read_excel(filepath, engine='openpyxl')
+        else:
+            df = pd.read_csv(filepath)
+        # 支持中文和英文表头
+        code_col = '代码' if '代码' in df.columns else 'code'
+        if code_col not in df.columns:
             return None
-        return set(df['code'].astype(str).tolist())
+        return set(df[code_col].astype(str).tolist())
     except Exception:
         return None
 
 
 def _get_regime_and_name(dl, target_date):
-    """Get market regime cache and name map for a specific date."""
+    """Get market regime cache, name map and industry map for a specific date."""
     regime_cache = {}
     for code, name in dl.INDEX_CODES.items():
         regime = dl.get_market_regime(target_date, code)
         regime_cache[code] = regime
 
     with dl._get_conn() as conn:
-        name_df = pd.read_sql("SELECT code, name FROM stock_meta", conn)
+        name_df = pd.read_sql("SELECT code, name, industry FROM stock_meta", conn)
     name_map = dict(zip(name_df['code'], name_df['name']))
+    industry_map = dict(zip(name_df['code'], name_df['industry'])) if 'industry' in name_df.columns else {}
 
-    return regime_cache, name_map
+    return regime_cache, name_map, industry_map
 
 
 def main():
@@ -345,13 +463,13 @@ def main():
     # 3. 确定对比基准（上一期选股结果）
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # 获取上一期CSV文件路径
+    # 获取上一期选股文件路径
     prev_scan_date = _get_real_prev_trading_date(effective_scan_date)
     prev_file = _signals_filepath(script_dir, prev_scan_date) if prev_scan_date else None
 
     prev_codes = None
     if prev_file and os.path.exists(prev_file):
-        prev_codes = _load_prev_csv(prev_file)
+        prev_codes = _load_prev_file(prev_file)
         if prev_codes is not None:
             print(f"\n[对比基准] 已加载上期选股文件 {os.path.basename(prev_file)}: {len(prev_codes)} 只")
         else:
@@ -361,17 +479,17 @@ def main():
         # 上一期文件不存在，需要先扫描上一期
         if prev_scan_date:
             print(f"\n[对比基准] 无上期选股文件，先扫描 {prev_scan_date} 作为基准...")
-            prev_regime, prev_names = _get_regime_and_name(dl, prev_scan_date)
+            prev_regime, prev_names, prev_industry = _get_regime_and_name(dl, prev_scan_date)
             scan_start = (datetime.strptime(effective_scan_date, '%Y-%m-%d') - timedelta(days=200)).strftime('%Y-%m-%d')
             t_scan = datetime.now()
-            prev_results = _scan_core(dl, codes, prev_regime, prev_names, scan_start, prev_scan_date, verbose=True)
+            prev_results = _scan_core(dl, codes, prev_regime, prev_names, prev_industry, scan_start, prev_scan_date, verbose=True)
             prev_elapsed = (datetime.now() - t_scan).total_seconds()
-            prev_codes = set(r['code'] for r in prev_results)
+            prev_codes = set(r['代码'] for r in prev_results)
             # 保存上一期的结果
-            prev_csv = _signals_filepath(script_dir, prev_scan_date)
+            prev_file = _signals_filepath(script_dir, prev_scan_date)
             if prev_results:
-                pd.DataFrame(prev_results).to_csv(prev_csv, index=False, encoding='utf-8-sig')
-                print(f"  已保存 {os.path.basename(prev_csv)} ({len(prev_results)} 只)")
+                pd.DataFrame(prev_results).to_excel(prev_file, index=False, engine='openpyxl')
+                print(f"  已保存 {os.path.basename(prev_file)} ({len(prev_results)} 只)")
             print(f"  上期({prev_scan_date})扫描耗时 {prev_elapsed:.1f}s, 发现 {len(prev_results)} 只候选")
         else:
             print("\n[对比基准] 无法找到上一交易日，标记为首次扫描")
@@ -389,8 +507,8 @@ def main():
     scan_start = (datetime.strptime(effective_scan_date, '%Y-%m-%d') - timedelta(days=200)).strftime('%Y-%m-%d')
     t1 = datetime.now()
 
-    regime_cache, name_map = _get_regime_and_name(dl, effective_scan_date)
-    results = _scan_core(dl, codes, regime_cache, name_map, scan_start, effective_scan_date, verbose=True)
+    regime_cache, name_map, industry_map = _get_regime_and_name(dl, effective_scan_date)
+    results = _scan_core(dl, codes, regime_cache, name_map, industry_map, scan_start, effective_scan_date, verbose=True)
     scan_elapsed = (datetime.now() - t1).total_seconds()
 
     # 打印结果
@@ -399,7 +517,7 @@ def main():
     # 保存结果（使用带日期的文件名）
     signals_file = _signals_filepath(script_dir, effective_scan_date)
     if results:
-        pd.DataFrame(results).to_csv(signals_file, index=False, encoding='utf-8-sig')
+        pd.DataFrame(results).to_excel(signals_file, index=False, engine='openpyxl')
         print(f"✅ 保存至 {os.path.basename(signals_file)}")
         # Record picks for tracking
         n_tracked = tracker.record_picks(pd.DataFrame(results), pick_date=effective_scan_date)

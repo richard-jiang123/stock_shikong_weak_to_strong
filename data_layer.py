@@ -52,6 +52,7 @@ class StockDataLayer:
                     name TEXT,
                     ipo_date TEXT,
                     delist_date TEXT,
+                    industry TEXT,
                     updated_at TEXT
                 );
 
@@ -113,6 +114,12 @@ class StockDataLayer:
                 );
             ''')
 
+            # 为已存在的数据库添加 industry 字段
+            try:
+                conn.execute("ALTER TABLE stock_meta ADD COLUMN industry TEXT")
+            except sqlite3.OperationalError:
+                pass  # 字段已存在
+
     def update_stock_list(self):
         """更新股票列表，失败时回退到本地缓存。假设 baostock 已登录。"""
         for attempt in range(5):
@@ -127,7 +134,7 @@ class StockDataLayer:
         else:
             # API 失败，使用本地缓存
             with self._get_conn() as conn:
-                df = pd.read_sql("SELECT code, name FROM stock_meta", conn)
+                df = pd.read_sql("SELECT code, name, industry FROM stock_meta", conn)
             if not df.empty:
                 print(f"  API不可用，使用本地缓存: {len(df)} 只")
                 return df
@@ -136,15 +143,68 @@ class StockDataLayer:
         mask = df['code'].str.match(r'^(sh\.60|sz\.00|sz\.30)\d{4}$')
         df = df[mask].copy()
 
+        # 获取行业分类数据
+        industry_map = self._fetch_industry_data()
+
         with self._get_conn() as conn:
             for _, row in df.iterrows():
+                code = row['code']
+                industry = industry_map.get(code, '')
                 conn.execute(
-                    "INSERT OR REPLACE INTO stock_meta (code, name, ipo_date, delist_date, updated_at) VALUES (?,?,?,?,?)",
-                    (row['code'], row.get('code_name',''), row.get('ipoDate',''), row.get('delistDate',''),
-                     datetime.now().strftime('%Y-%m-%d %H:%M'))
+                    "INSERT OR REPLACE INTO stock_meta (code, name, ipo_date, delist_date, industry, updated_at) VALUES (?,?,?,?,?,?)",
+                    (code, row.get('code_name',''), row.get('ipoDate',''), row.get('delistDate',''),
+                     industry, datetime.now().strftime('%Y-%m-%d %H:%M'))
                 )
-        print(f"  股票列表已更新: {len(df)} 只")
+        print(f"  股票列表已更新: {len(df)} 只（行业: {len(industry_map)} 只有数据）")
         return df
+
+    def _fetch_industry_data(self):
+        """从 baostock 获取股票行业分类数据"""
+        industry_map = {}
+        try:
+            rs = bs.query_stock_industry()
+            data = rs.get_data()
+            if data is not None and len(data) > 0:
+                for _, row in data.iterrows():
+                    code = row['code']
+                    industry = row.get('industry', '')
+                    if industry:
+                        # 提取行业名称（去掉代码前缀如C33、J66等：字母+2位数字）
+                        if len(industry) > 3 and industry[0].isupper() and industry[1:3].isdigit():
+                            industry_name = industry[3:]
+                        elif len(industry) > 2 and industry[0].isupper() and industry[1].isdigit():
+                            industry_name = industry[2:]
+                        else:
+                            industry_name = industry
+                        industry_map[code] = industry_name[:10]  # 截取前10字符
+        except Exception as e:
+            print(f"  获取行业数据失败: {e}")
+        return industry_map
+
+    def update_industry_data(self):
+        """单独更新行业数据（用于补充已有股票的行业信息）"""
+        industry_map = self._fetch_industry_data()
+        if not industry_map:
+            print("  无行业数据，跳过更新")
+            return 0
+
+        with self._get_conn() as conn:
+            updated = 0
+            for code, industry in industry_map.items():
+                result = conn.execute(
+                    "UPDATE stock_meta SET industry=? WHERE code=?",
+                    (industry, code)
+                )
+                if result.rowcount > 0:
+                    updated += 1
+        print(f"  行业数据已更新: {updated} 只")
+        return updated
+
+    def get_industry_map(self):
+        """从数据库获取行业映射"""
+        with self._get_conn() as conn:
+            df = pd.read_sql("SELECT code, industry FROM stock_meta WHERE industry IS NOT NULL", conn)
+        return dict(zip(df['code'], df['industry']))
 
     def _get_incomplete_count(self, target_date):
         """检查有多少股票的数据未达到目标日期（最后一条数据早于目标日期）。
@@ -535,7 +595,6 @@ class StockDataLayer:
             'stocks': [],
             'no_record_stocks': [],
             'bad_quality_stocks': [],
-            'no_record_stocks': [],
             'indexes': [],
             'optional_indexes_missing': final_missing_optional
         }

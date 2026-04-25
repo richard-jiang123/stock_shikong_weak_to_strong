@@ -13,6 +13,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_layer import get_data_layer
 from strategy_config import StrategyConfig
 
+# ANSI 颜色代码
+RED = '\033[91m'    # 红色（正值/盈利）
+GREEN = '\033[92m'  # 绿色（负值/亏损）
+RESET = '\033[0m'   # 重置颜色
+
+def color_pnl(value, suffix='%'):
+    """根据正负值返回带颜色的盈亏字符串"""
+    if value > 0:
+        return f"{RED}{value:+.2f}{suffix}{RESET}"
+    elif value < 0:
+        return f"{GREEN}{value:+.2f}{suffix}{RESET}"
+    else:
+        return f"{value:.2f}{suffix}"
+
 
 class PickTracker:
     """Track daily picks and simulate their post-pick performance."""
@@ -102,7 +116,8 @@ class PickTracker:
 
             for row in rows:
                 # Convert code back to baostock format
-                code_str = str(row.get('code', ''))
+                # 支持中文和英文表头
+                code_str = str(row.get('代码', row.get('code', '')))
                 if '.' not in code_str:
                     # Zero-pad to 6 digits
                     code_str = code_str.zfill(6)
@@ -118,17 +133,17 @@ class PickTracker:
                      entry_price, stop_loss, cons_low, market_regime, index_code, name, status)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'active')''',
                     (pick_date, code,
-                     row.get('signal', ''),
-                     float(row.get('score', 0)),
-                     float(row.get('wave_gain', 0)),
-                     float(row.get('cons_dd', 0)),
-                     float(row.get('vol_ratio', 0)),
-                     float(row.get('entry', 0)),
-                     float(row.get('stop_loss', 0)),
+                     row.get('信号', row.get('signal', '')),
+                     float(row.get('评分', row.get('score', 0))),
+                     float(row.get('波段涨幅', row.get('wave_gain', 0))),
+                     float(row.get('回调', row.get('cons_dd', 0))),
+                     float(row.get('量比', row.get('vol_ratio', 0))),
+                     float(row.get('入场价', row.get('entry', 0))),
+                     float(row.get('止损位', row.get('stop_loss', 0))),
                      float(row.get('cons_low', 0)),
-                     row.get('market_regime', ''),
-                     row.get('index', ''),
-                     row.get('name', '')))
+                     row.get('市场环境', row.get('market_regime', '')),
+                     row.get('指数', row.get('index', '')),
+                     row.get('名称', row.get('name', ''))))
                 count += 1
         return count
 
@@ -502,10 +517,10 @@ if __name__ == '__main__':
             print(f"  已退出: {s.get('exited', 0)} 只 | 仍活跃: {s.get('still_active', 0)} 只")
             if s.get('exited', 0) > 0:
                 print(f"  胜率: {s.get('win_rate', 0):.1f}%")
-                print(f"  平均盈亏: {s.get('avg_pnl', 0):+.2f}%")
+                print(f"  平均盈亏: {color_pnl(s.get('avg_pnl', 0))}")
                 print(f"  平均持仓: {s.get('avg_hold_days', 0):.1f} 天")
-                print(f"  最大盈利: {s.get('max_pnl', 0):+.2f}%")
-                print(f"  最大亏损: {s.get('min_pnl', 0):+.2f}%")
+                print(f"  最大盈利: {color_pnl(s.get('max_pnl', 0))}")
+                print(f"  最大亏损: {color_pnl(s.get('min_pnl', 0))}")
             if sc.get('score_predictive_power') is not None:
                 corr = sc['score_predictive_power']
                 print(f"\n  评分预测力 (Spearman相关): {corr:+.3f}")
@@ -516,11 +531,11 @@ if __name__ == '__main__':
             if 'by_signal_type' in sc:
                 print(f"\n  按信号类型:")
                 for sig, data in sc['by_signal_type'].items():
-                    print(f"    {sig}: {data['count']}笔 胜率{data['win_rate']:.1f}% 平均{data['avg_pnl']:+.2f}%")
+                    print(f"    {sig}: {data['count']}笔 胜率{data['win_rate']:.1f}% 平均{color_pnl(data['avg_pnl'])}")
             if 'by_market_regime' in sc:
                 print(f"\n  按市场环境:")
                 for regime, data in sc['by_market_regime'].items():
-                    print(f"    {regime}: {data['count']}笔 胜率{data['win_rate']:.1f}% 平均{data['avg_pnl']:+.2f}%")
+                    print(f"    {regime}: {data['count']}笔 胜率{data['win_rate']:.1f}% 平均{color_pnl(data['avg_pnl'])}")
         elif sc and 'message' in sc:
             print(f"  {sc['message']}")
         else:
