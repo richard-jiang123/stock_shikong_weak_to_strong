@@ -97,23 +97,24 @@ class PickTracker:
 
     def _migrate_pick_tracking_scores(self):
         """迁移：为现有 pick_tracking 表添加评分字段"""
-        columns = self._get_conn().execute("PRAGMA table_info(pick_tracking)").fetchall()
-        col_names = [c[1] for c in columns]
+        with self._get_conn() as conn:
+            columns = conn.execute("PRAGMA table_info(pick_tracking)").fetchall()
+            col_names = [c[1] for c in columns]
 
-        migrations = [
-            ('score_wave_gain', 'REAL'),
-            ('score_shallow_dd', 'REAL'),
-            ('score_day_gain', 'REAL'),
-            ('score_volume', 'REAL'),
-            ('score_ma_bull', 'REAL'),
-            ('score_sector', 'REAL'),
-            ('score_signal_bonus', 'REAL'),
-            ('score_base', 'REAL DEFAULT 5'),
-        ]
+            migrations = [
+                ('score_wave_gain', 'REAL'),
+                ('score_shallow_dd', 'REAL'),
+                ('score_day_gain', 'REAL'),
+                ('score_volume', 'REAL'),
+                ('score_ma_bull', 'REAL'),
+                ('score_sector', 'REAL'),
+                ('score_signal_bonus', 'REAL'),
+                ('score_base', 'REAL DEFAULT 5'),
+            ]
 
-        for col_name, col_type in migrations:
-            if col_name not in col_names:
-                self._get_conn().execute(f"ALTER TABLE pick_tracking ADD COLUMN {col_name} {col_type}")
+            for col_name, col_type in migrations:
+                if col_name not in col_names:
+                    conn.execute(f"ALTER TABLE pick_tracking ADD COLUMN {col_name} {col_type}")
 
     # ── Record picks ──────────────────────────────────────────────
 
