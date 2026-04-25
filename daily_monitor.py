@@ -11,7 +11,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_layer import get_data_layer, StockDataLayer
 from strategy_config import StrategyConfig
-from signal_constants import SIGNAL_TYPE_MAPPING, normalize_signal_type
+from signal_constants import SIGNAL_TYPE_MAPPING
 
 
 def calculate_expectancy(win_rate, avg_win, avg_loss):
@@ -122,7 +122,7 @@ class DailyMonitor:
                 pnls = [r[0] for r in rows]
                 win_rate = sum(1 for p in pnls if p > 0) / len(pnls)
                 avg_win = np.mean([p for p in pnls if p > 0]) if any(p > 0 for p in pnls) else 0
-                avg_loss = np.mean([p for p in pnls if p < 0]) if any(p < 0 for p in pnls) else 0
+                avg_loss = abs(np.mean([p for p in pnls if p < 0])) if any(p < 0 for p in pnls) else 0
 
                 expectancy_lb = wilson_expectancy_lower_bound(win_rate, avg_win, avg_loss, len(pnls))
 
@@ -293,9 +293,10 @@ class DailyMonitor:
                     VALUES (?, ?, ?, ?, 'logged')
                 """, (monitor_date, alert['type'], alert['detail'], alert['severity']))
 
-    def print_summary(self, alerts):
+    def print_summary(self, alerts, monitor_date=None):
         """打印监控摘要"""
-        print(f"\n[每日监控] {datetime.now().strftime('%Y-%m-%d')}")
+        date_str = monitor_date if monitor_date else datetime.now().strftime('%Y-%m-%d')
+        print(f"\n[每日监控] {date_str}")
 
         if not alerts:
             print("  OK 无异常预警")
