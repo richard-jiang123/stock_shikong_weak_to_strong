@@ -130,10 +130,44 @@ def _get_industry_map(dl):
     return dl.get_industry_map()
 
 
+def _compute_sector_momentum(codes_in_sector, kline_cache, lookback=10):
+    """计算板块动量：板块内股票最近lookback天的平均涨跌幅
+
+    Args:
+        codes_in_sector: 板块内股票代码列表
+        kline_cache: K线数据缓存
+        lookback: 回看天数
+
+    Returns:
+        (avg_momentum, is_strong): 平均动量和是否强势板块
+    """
+    if len(codes_in_sector) == 0:
+        return 0.0, False
+
+    returns = []
+    for code in codes_in_sector[:20]:  # 取前20只代表股票
+        if code not in kline_cache:
+            continue
+        df = kline_cache[code]
+        if df is not None and len(df) >= lookback:
+            # 最近lookback天的平均涨跌幅
+            avg_ret = df.iloc[-lookback:]['pct_chg'].mean()
+            returns.append(avg_ret)
+
+    if not returns:
+        return 0.0, False
+
+    avg_momentum = np.mean(returns)
+    # 强势板块定义：平均涨幅 > 0.5%/天
+    is_strong = avg_momentum > 0.005
+    return avg_momentum, is_strong
+
+
 def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_date, verbose=True):
     """
     Run pattern scan for data up to end_date. Returns list of result dicts.
     Optimized: batch load data first, then fast iteration.
+    Includes sector momentum scoring.
     """
     # 提前过滤ST股票
     filtered_codes = [c for c in codes if 'ST' not in name_map.get(c, '').upper()]
@@ -144,6 +178,24 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
     # 批量加载K线数据
     kline_cache = dl.get_kline_batch(filtered_codes, start_date, end_date)
 
+    # 按行业分组股票代码
+    industry_groups = {}
+    for code in filtered_codes:
+        industry = industry_map.get(code, '其他')
+        if industry not in industry_groups:
+            industry_groups[industry] = []
+        industry_groups[industry].append(code)
+
+    # 计算各行业板块动量缓存
+    sector_momentum_cache = {}
+    if verbose and len(industry_groups) > 0:
+        print(f"  计算板块动量: {len(industry_groups)} 个行业")
+        sys.stdout.flush()
+
+    for industry, group_codes in industry_groups.items():
+        momentum, is_strong = _compute_sector_momentum(group_codes, kline_cache, lookback=10)
+        sector_momentum_cache[industry] = {'momentum': momentum, 'strong': is_strong}
+
     results = []
     for i, code in enumerate(filtered_codes):
         if code not in kline_cache:
@@ -153,18 +205,35 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
         if r:
             last = df.iloc[-1]
             index_code = dl.code_to_index(code).split('.')[1]
+            industry = industry_map.get(code, '')
+
+            # 获取板块动量状态
+            sector_info = sector_momentum_cache.get(industry, {'momentum': 0, 'strong': False})
+            sector_strong = sector_info['strong']
+
+            # 添加板块动量评分
+            score = r['score']
+            reasons = r['reasons']
+            if sector_strong:
+                score += 5  # 强势板块加分
+                if reasons:
+                    reasons = reasons + ' | 强势板块'
+                else:
+                    reasons = '强势板块'
+
             results.append({
                 '代码': code.split('.')[1], '名称': name_map.get(code, ''),
                 '现价': last['close'],
                 '涨幅': last['pct_chg'], '信号': r['sig'],
-                '评分': r['score'], '波段涨幅': r['wg'],
+                '评分': score, '波段涨幅': r['wg'],
                 '回调': r['dd'], '量比': r['vr'],
                 '止损位': r['sl'], '入场价': r['ep'],
                 '指数': index_code,
                 '市场环境': {'bull': '上升期', 'range': '震荡期', 'bear': '退潮期'}.get(
                     regime_cache.get(dl.code_to_index(code), 'range'), '震荡期'),
-                '行业': industry_map.get(code, ''),
-                '原因': r['reasons'],
+                '行业': industry,
+                '板块强势': sector_strong,
+                '原因': reasons,
             })
         if verbose and ((i+1) % 500 == 0 or i + 1 == len(filtered_codes)):
             print(f"  扫描 {i+1}/{len(filtered_codes)} | 命中 {len(results)}")

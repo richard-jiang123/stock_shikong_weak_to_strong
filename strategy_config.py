@@ -41,6 +41,7 @@ class StrategyConfig:
         'score_full_bull':          (10,   'scoring', 'Bonus: MA5>MA10>MA20'),
         'score_partial_bull':       (5,    'scoring', 'Bonus: MA5>MA10'),
         'score_anomaly_bonus':      (10,   'scoring', 'Extra bonus for anomaly signal'),
+        'score_sector_strong':       (5,    'scoring', 'Bonus: strong sector momentum'),
     }
 
     def __init__(self, db_path=None):
