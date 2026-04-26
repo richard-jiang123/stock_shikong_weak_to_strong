@@ -72,29 +72,82 @@ acquire_lock() {
     local lock_name="$1"
     local timeout="${2:-60}"
 
-    # 启动锁子进程（不重定向 stdin，输出直接到终端）
-    # 使用 -u 参数禁用 Python stdout 缓冲
-    python3 -u "${SCRIPT_DIR}/process_lock.py" --acquire "${lock_name}" --timeout "${timeout}" &
+    # 创建临时文件用于捕获子进程输出
+    local output_file=$(mktemp)
+
+    # 启动锁子进程（输出到临时文件）
+    # 使用 -u 禁用 Python stdout 缓冲
+    python3 -u "${SCRIPT_DIR}/process_lock.py" --acquire "${lock_name}" --timeout "${timeout}" > "$output_file" 2>&1 &
     LOCK_PID=$!
 
-    # 等待子进程启动并检查存活
-    sleep 1
+    # 等待锁获取确认（轮询检查输出文件）
+    # 使用秒数计数，每次 sleep 0.5
+    local start_time=$(date '+%s')
+    local max_wait=$((timeout + 5))  # 比 Python timeout 多一点
+    local current_time
+    local elapsed
 
-    # 用 kill -0 检查进程存活（不发信号，只检查）
-    if ! kill -0 "$LOCK_PID" 2>/dev/null; then
-        # 进程已退出，等待获取退出码
-        wait "$LOCK_PID" 2>/dev/null
-        local exit_code=$?
-        if [ $exit_code -eq 1 ]; then
-            log "  ✗ 获取锁超时，可能有其他实例正在运行"
-        else
-            log "  ✗ 锁进程异常退出 (exit=${exit_code})"
+    while true; do
+        # 计算已等待时间（秒）
+        current_time=$(date '+%s')
+        elapsed=$((current_time - start_time))
+
+        # 超时检查
+        if [ $elapsed -ge $max_wait ]; then
+            rm -f "$output_file"
+            log "  ✗ 等待锁确认超时 (${elapsed}秒)"
+            # 清理进程和残留文件
+            if kill -0 "$LOCK_PID" 2>/dev/null; then
+                kill "$LOCK_PID" 2>/dev/null
+                wait "$LOCK_PID" 2>/dev/null
+            fi
+            rm -f "${SCRIPT_DIR}/.locks/${lock_name}.lock" 2>/dev/null
+            unset LOCK_PID
+            end_run "fail"
+            exit 1
         fi
-        end_run "fail"
-        exit 1
-    fi
 
-    log "  锁已获取 (PID=${LOCK_PID})"
+        # 检查进程是否已退出
+        if ! kill -0 "$LOCK_PID" 2>/dev/null; then
+            # 进程已退出，读取输出判断原因
+            wait "$LOCK_PID" 2>/dev/null
+            local exit_code=$?
+            local result=$(cat "$output_file" 2>/dev/null)
+            rm -f "$output_file"
+
+            if [[ "$result" == *"LOCK_TIMEOUT"* ]] || [ $exit_code -eq 1 ]; then
+                log "  ✗ 获取锁超时，可能有其他实例正在运行"
+            elif [[ "$result" == *"LOCK_ACQUIRED"* ]]; then
+                # 进程已退出但确实获取了锁（不应发生，但处理）
+                log "  ✗ 锁进程意外退出（获取锁后退出）"
+            else
+                log "  ✗ 锁进程异常退出 (exit=${exit_code}, output=${result})"
+            fi
+            unset LOCK_PID
+            end_run "fail"
+            exit 1
+        fi
+
+        # 检查是否已输出 LOCK_ACQUIRED
+        local result=$(cat "$output_file" 2>/dev/null)
+        if [[ "$result" == *"LOCK_ACQUIRED"* ]]; then
+            rm -f "$output_file"
+            log "  锁已获取 (PID=${LOCK_PID}, 等待${elapsed}秒)"
+            return 0  # 成功
+        fi
+
+        # 检查是否已输出 LOCK_TIMEOUT（进程可能还在等待但已超时）
+        if [[ "$result" == *"LOCK_TIMEOUT"* ]]; then
+            rm -f "$output_file"
+            log "  ✗ 获取锁超时，可能有其他实例正在运行"
+            unset LOCK_PID
+            end_run "fail"
+            exit 1
+        fi
+
+        # 等待一小段时间再检查
+        sleep 0.5
+    done
 }
 
 # 检查锁进程是否仍然存活（运行期间调用）
