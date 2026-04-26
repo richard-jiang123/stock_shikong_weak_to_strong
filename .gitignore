@@ -22,3 +22,7 @@ __pycache__/
 
 # Lock files (runtime generated)
 .locks/
+
+# Git worktrees
+.claude/worktrees/
+.worktrees/
