@@ -899,10 +899,11 @@ class TestChangeManager(unittest.TestCase):
         with sqlite3.connect(self.db_path) as conn:
             # 插入已退出的交易数据，exit_date 控制在测试范围内
             # 只插入 yesterday 和 today 的数据（共2条）
+            # final_pnl_pct 存储格式：小数形式（0.038 表示 3.8%）
             test_data = [
-                (three_days_ago, 'sh600001', 'anomaly_no_decline', 'exited', two_days_ago, 2.5),  # 不在范围内
-                (two_days_ago, 'sh600003', 'big_bullish_reversal', 'exited', yesterday, 3.8),     # 在范围内
-                (two_days_ago, 'sh600004', 'limit_up_open_next_strong', 'exited', today, 0.5),    # 在范围内
+                (three_days_ago, 'sh600001', 'anomaly_no_decline', 'exited', two_days_ago, 0.025),  # 不在范围内
+                (two_days_ago, 'sh600003', 'big_bullish_reversal', 'exited', yesterday, 0.038),     # 在范围内（3.8%）
+                (two_days_ago, 'sh600004', 'limit_up_open_next_strong', 'exited', today, 0.005),    # 在范围内（0.5%）
             ]
             for data in test_data:
                 conn.execute("""
@@ -959,13 +960,14 @@ class TestChangeManager(unittest.TestCase):
 
         # 先插入基线数据（positive pnl），在 [35天前, 5天前] 范围内
         # 这些数据将在 baseline 范围 [30天前snapshot, snapshot] 内
+        # final_pnl_pct 存储格式：小数形式（0.042 表示 4.2%）
         with sqlite3.connect(self.db_path) as conn:
             # 插入10条正 pnl 数据作为基线
             for i in range(10):
                 conn.execute("""
                     INSERT INTO pick_tracking
                     (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
-                    VALUES (?, ?, ?, 'exited', ?, 4.2)
+                    VALUES (?, ?, ?, 'exited', ?, 0.042)
                 """, (thirty_days_ago, f'sh9000{i}', 'anomaly_no_decline', five_days_ago))
 
         # 保存快照（snapshot_date 将被设置为模拟时间）
@@ -990,11 +992,12 @@ class TestChangeManager(unittest.TestCase):
             """, (five_days_ago_ts, snapshot_id))
 
             # 插入当前数据（negative pnl），在 [5天前, 今天] 范围内
+            # final_pnl_pct 存储格式：小数形式（-0.05 表示 -5%）
             for i in range(15):
                 conn.execute("""
                     INSERT INTO pick_tracking
                     (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
-                    VALUES (?, ?, ?, 'exited', ?, -5.0)
+                    VALUES (?, ?, ?, 'exited', ?, -0.05)
                 """, (five_days_ago, f'sh6000{i}', 'anomaly_no_decline', today))
 
         # 获取批次信息
@@ -1050,19 +1053,21 @@ class TestChangeManager(unittest.TestCase):
 
         with sqlite3.connect(self.db_path) as conn:
             # 连续5天负 pnl（每天2条），exit_date 从今天往前5天
+            # final_pnl_pct 存储格式：小数形式（-0.02 表示 -2%）
             for day in [today, yesterday, two_days_ago, three_days_ago, four_days_ago]:
                 for i in range(2):
                     conn.execute("""
                         INSERT INTO pick_tracking
                         (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
-                        VALUES (?, ?, ?, 'exited', ?, -2.0)
+                        VALUES (?, ?, ?, 'exited', ?, -0.02)
                     """, (five_days_ago, f'sh600{day.replace("-", "")}{i}', 'anomaly_no_decline', day))
 
             # 第6天插入正 pnl（中断连续负期望值）
+            # final_pnl_pct 存储格式：小数形式（0.05 表示 5%）
             conn.execute("""
                 INSERT INTO pick_tracking
                 (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
-                VALUES (?, ?, ?, 'exited', ?, 5.0)
+                VALUES (?, ?, ?, 'exited', ?, 0.05)
             """, (five_days_ago, 'sh60000100', 'anomaly_no_decline', five_days_ago))
 
         # 检查连续负期望值天数
@@ -1131,7 +1136,7 @@ class TestChangeManager(unittest.TestCase):
                 conn.execute("""
                     INSERT INTO pick_tracking
                     (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
-                    VALUES (?, ?, ?, 'exited', ?, 4.2)
+                    VALUES (?, ?, ?, 'exited', ?, 0.042)
                 """, (thirty_days_ago, f'sh9000{i}', 'anomaly_no_decline', five_days_ago))
 
         # 保存快照
@@ -1160,16 +1165,17 @@ class TestChangeManager(unittest.TestCase):
                 conn.execute("""
                     INSERT INTO pick_tracking
                     (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
-                    VALUES (?, ?, ?, 'exited', ?, -5.0)
+                    VALUES (?, ?, ?, 'exited', ?, -0.05)
                 """, (five_days_ago, f'sh6000{i}', 'anomaly_no_decline', today))
 
             # 连续5天负 pnl（触发 consecutive_bad_days）
+            # final_pnl_pct 存储格式：小数形式（-0.02 表示 -2%）
             for day in [today, yesterday, two_days_ago, three_days_ago, four_days_ago]:
                 for i in range(2):
                     conn.execute("""
                         INSERT INTO pick_tracking
                         (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
-                        VALUES (?, ?, ?, 'exited', ?, -2.0)
+                        VALUES (?, ?, ?, 'exited', ?, -0.02)
                     """, (five_days_ago, f'sh600{day.replace("-", "")}{i}', 'anomaly_no_decline', day))
 
         # 执行监控和回滚
@@ -1324,6 +1330,113 @@ class TestChangeManager(unittest.TestCase):
 
         result = engine.run_daily()
         self.assertIn('rollback_monitor', result)
+
+    # ─────────────────────────────────────────────
+    # 新增测试：覆盖修复的场景
+    # ─────────────────────────────────────────────
+
+    def test_expectancy_baseline_zero_triggers_rollback(self):
+        """测试：baseline expectancy=0 且 current<0 时触发回滚（修复C1）"""
+        batch_id = 'batch_zero_baseline_001'
+
+        # 模拟场景：baseline expectancy=0，current expectancy=-5%
+        five_days_ago_ts = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d %H:%M:%S')
+        five_days_ago = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+        thirty_days_ago = (datetime.now() - timedelta(days=35)).strftime('%Y-%m-%d')
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # 插入基线数据（expectancy=0）
+        with sqlite3.connect(self.db_path) as conn:
+            for i in range(10):
+                conn.execute("""
+                    INSERT INTO pick_tracking
+                    (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                    VALUES (?, ?, ?, 'exited', ?, 0.0)
+                """, (thirty_days_ago, f'sh9000{i}', 'anomaly_no_decline', five_days_ago))
+
+        # 保存快照
+        snapshot_id = self.mgr.save_snapshot('weekly_optimize', batch_id, 'pre_change')
+
+        # 暂存并提交变更
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=5,
+            batch_id=batch_id
+        )
+        self.mgr.commit_change(sandbox_id)
+
+        # 更新 applied_at 和 snapshot_date
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE sandbox_config SET applied_at = ? WHERE batch_id = ?
+            """, (five_days_ago_ts, batch_id))
+            conn.execute("""
+                UPDATE param_snapshot SET snapshot_date = ? WHERE id = ?
+            """, (five_days_ago_ts, snapshot_id))
+
+            # 插入当前数据（expectancy=-5%）
+            for i in range(15):
+                conn.execute("""
+                    INSERT INTO pick_tracking
+                    (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                    VALUES (?, ?, ?, 'exited', ?, -0.05)
+                """, (five_days_ago, f'sh6000{i}', 'anomaly_no_decline', today))
+
+        # 获取批次信息
+        batches = self.mgr.get_applied_batches_in_monitor_window()
+        target_batch = next(b for b in batches if b['batch_id'] == batch_id)
+
+        # 检查性能退化
+        degradation = self.mgr.check_performance_degradation(target_batch)
+
+        # 验证：baseline=0, current=-5%，expectancy_drop应为1（完全退化）
+        self.assertTrue(degradation['should_rollback'])
+        self.assertEqual(degradation['expectancy_drop'], 1)
+        self.assertIn('expectancy_drop', degradation['reason'])
+
+    def test_restore_snapshot_with_corrupted_json(self):
+        """测试：损坏的JSON不会导致崩溃（修复I2）"""
+        batch_id = 'batch_corrupted_json_001'
+
+        # 直接插入一条损坏的JSON快照
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO param_snapshot
+                (snapshot_date, snapshot_type, batch_id, trigger_reason, params_json, signal_status_json, environment_json)
+                VALUES (?, 'pre_change', ?, 'test', '{invalid json}', 'also broken', '{"good": true}')
+            """, (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), batch_id))
+            corrupted_snapshot_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # 尝试恢复：损坏的params_json和signal_status_json会返回空dict/list，但environment_dict正常
+        result = self.mgr.restore_snapshot(corrupted_snapshot_id, reason='test_corrupted')
+
+        # 验证恢复成功（虽然数据为空，但不会崩溃）
+        self.assertTrue(result)
+
+        # 验证快照已标记为已恢复
+        snapshot = self.mgr.get_snapshot_by_id(corrupted_snapshot_id)
+        self.assertEqual(snapshot['is_restored'], 1)
+
+    def test_stage_change_missing_signal_type(self):
+        """测试：signal_type不存在时使用'unknown'（修复I4）"""
+        batch_id = 'batch_missing_signal_001'
+
+        # 暂存一个不存在的signal_type变更
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='signal_status',
+            param_key='nonexistent_signal_type',
+            new_value='watching',
+            batch_id=batch_id
+        )
+
+        # 验证暂存成功
+        self.assertGreater(sandbox_id, 0)
+
+        # 验证current_value为'unknown'（而非None字符串）
+        params = self.mgr.get_staged_params(batch_id)
+        self.assertEqual(len(params), 1)
+        self.assertEqual(params[0]['current_value'], 'unknown')
 
 
 if __name__ == '__main__':

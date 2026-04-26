@@ -89,31 +89,19 @@ class ChangeManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sandbox_status ON sandbox_config(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sandbox_type ON sandbox_config(optimize_type)")
 
-            # optimization_history 扩展字段
-            try:
-                conn.execute("ALTER TABLE optimization_history ADD COLUMN batch_id TEXT")
-            except Exception:
-                pass
-            try:
-                conn.execute("ALTER TABLE optimization_history ADD COLUMN snapshot_id INTEGER")
-            except Exception:
-                pass
-            try:
-                conn.execute("ALTER TABLE optimization_history ADD COLUMN trigger_reason TEXT")
-            except Exception:
-                pass
-            try:
-                conn.execute("ALTER TABLE optimization_history ADD COLUMN rollback_triggered INTEGER DEFAULT 0")
-            except Exception:
-                pass
-            try:
-                conn.execute("ALTER TABLE optimization_history ADD COLUMN rollback_at TEXT")
-            except Exception:
-                pass
-            try:
-                conn.execute("ALTER TABLE optimization_history ADD COLUMN rollback_reason TEXT")
-            except Exception:
-                pass
+            # optimization_history 扩展字段（sqlite3.OperationalError: column already exists）
+            for alter_sql in [
+                "ALTER TABLE optimization_history ADD COLUMN batch_id TEXT",
+                "ALTER TABLE optimization_history ADD COLUMN snapshot_id INTEGER",
+                "ALTER TABLE optimization_history ADD COLUMN trigger_reason TEXT",
+                "ALTER TABLE optimization_history ADD COLUMN rollback_triggered INTEGER DEFAULT 0",
+                "ALTER TABLE optimization_history ADD COLUMN rollback_at TEXT",
+                "ALTER TABLE optimization_history ADD COLUMN rollback_reason TEXT",
+            ]:
+                try:
+                    conn.execute(alter_sql)
+                except sqlite3.OperationalError:
+                    pass  # 列已存在
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_opt_history_batch ON optimization_history(batch_id)")
 
@@ -219,9 +207,21 @@ class ChangeManager:
         signal_status_json = row[1]
         environment_json = row[2]
 
-        params_dict = json.loads(params_json) if params_json else {}
-        signal_status = json.loads(signal_status_json) if signal_status_json else []
-        environment_dict = json.loads(environment_json) if environment_json else {}
+        # 解析JSON（添加异常处理防止损坏数据导致崩溃）
+        try:
+            params_dict = json.loads(params_json) if params_json else {}
+        except json.JSONDecodeError:
+            params_dict = {}
+
+        try:
+            signal_status = json.loads(signal_status_json) if signal_status_json else []
+        except json.JSONDecodeError:
+            signal_status = []
+
+        try:
+            environment_dict = json.loads(environment_json) if environment_json else {}
+        except json.JSONDecodeError:
+            environment_dict = {}
 
         # 2. 原子写入（单事务）
         with self.dl._get_conn() as conn:
@@ -302,15 +302,29 @@ class ChangeManager:
         if row is None:
             return None
 
+        # 解析JSON（添加异常处理防止损坏数据）
+        try:
+            params = json.loads(row[5]) if row[5] else {}
+        except json.JSONDecodeError:
+            params = {}
+        try:
+            signal_status = json.loads(row[6]) if row[6] else []
+        except json.JSONDecodeError:
+            signal_status = []
+        try:
+            environment = json.loads(row[7]) if row[7] else {}
+        except json.JSONDecodeError:
+            environment = {}
+
         return {
             'id': row[0],
             'snapshot_date': row[1],
             'snapshot_type': row[2],
             'batch_id': row[3],
             'trigger_reason': row[4],
-            'params': json.loads(row[5]) if row[5] else {},
-            'signal_status': json.loads(row[6]) if row[6] else [],
-            'environment': json.loads(row[7]) if row[7] else {},
+            'params': params,
+            'signal_status': signal_status,
+            'environment': environment,
             'is_restored': row[8],
             'restored_at': row[9],
             'restore_reason': row[10],
@@ -339,15 +353,29 @@ class ChangeManager:
         if row is None:
             return None
 
+        # 解析JSON（添加异常处理防止损坏数据）
+        try:
+            params = json.loads(row[5]) if row[5] else {}
+        except json.JSONDecodeError:
+            params = {}
+        try:
+            signal_status = json.loads(row[6]) if row[6] else []
+        except json.JSONDecodeError:
+            signal_status = []
+        try:
+            environment = json.loads(row[7]) if row[7] else {}
+        except json.JSONDecodeError:
+            environment = {}
+
         return {
             'id': row[0],
             'snapshot_date': row[1],
             'snapshot_type': row[2],
             'batch_id': row[3],
             'trigger_reason': row[4],
-            'params': json.loads(row[5]) if row[5] else {},
-            'signal_status': json.loads(row[6]) if row[6] else [],
-            'environment': json.loads(row[7]) if row[7] else {},
+            'params': params,
+            'signal_status': signal_status,
+            'environment': environment,
             'is_restored': row[8],
             'restored_at': row[9],
             'restore_reason': row[10],
@@ -381,7 +409,7 @@ class ChangeManager:
                     row = conn.execute("""
                         SELECT status_level FROM signal_status WHERE signal_type = ?
                     """, (param_key,)).fetchone()
-                    current_value = row[0] if row else None
+                    current_value = row[0] if row else 'unknown'
             else:
                 # 从 strategy_config 获取当前值
                 current_value = self.cfg.get(param_key)
@@ -977,6 +1005,12 @@ class ChangeManager:
         expectancy_drop = 0
         if baseline['expectancy'] > 0 and current['expectancy'] < baseline['expectancy']:
             expectancy_drop = (baseline['expectancy'] - current['expectancy']) / baseline['expectancy']
+        elif baseline['expectancy'] == 0 and current['expectancy'] < 0:
+            # 从中性变成负值，完全退化
+            expectancy_drop = 1
+        elif baseline['expectancy'] < 0 and current['expectancy'] < baseline['expectancy']:
+            # 从负值变得更负，也算退化
+            expectancy_drop = (abs(current['expectancy']) - abs(baseline['expectancy'])) / max(abs(baseline['expectancy']), 0.01)
 
         win_rate_drop = baseline['win_rate'] - current['win_rate']
 
@@ -1107,8 +1141,8 @@ class ChangeManager:
                 'sample_count': 0
             }
 
-        # 计算期望值（平均盈亏百分比）
-        expectancy = sum(pnl_values) / len(pnl_values)
+        # 计算期望值（平均盈亏百分比，转为百分比形式与其他方法一致）
+        expectancy = (sum(pnl_values) / len(pnl_values)) * 100
 
         # 计算胜率（盈利样本占比）
         wins = sum(1 for pnl in pnl_values if pnl > 0)
@@ -1230,21 +1264,18 @@ class ChangeManager:
     def get_status_summary(self) -> Dict:
         """获取变更管理状态摘要"""
         with self.dl._get_conn() as conn:
-            staged_count = conn.execute(
-                "SELECT COUNT(*) FROM sandbox_config WHERE status='staged'"
-            ).fetchone()[0]
+            # 合并为单个 GROUP BY 查询（性能优化）
+            rows = conn.execute("""
+                SELECT status, COUNT(*) as count
+                FROM sandbox_config
+                GROUP BY status
+            """).fetchall()
 
-            validating_count = conn.execute(
-                "SELECT COUNT(*) FROM sandbox_config WHERE status='validating'"
-            ).fetchone()[0]
-
-            passed_count = conn.execute(
-                "SELECT COUNT(*) FROM sandbox_config WHERE status='passed'"
-            ).fetchone()[0]
-
-            applied_count = conn.execute(
-                "SELECT COUNT(*) FROM sandbox_config WHERE status='applied'"
-            ).fetchone()[0]
+            status_counts = {row[0]: row[1] for row in rows}
+            staged_count = status_counts.get('staged', 0)
+            validating_count = status_counts.get('validating', 0)
+            passed_count = status_counts.get('passed', 0)
+            applied_count = status_counts.get('applied', 0)
 
             rollback_count = conn.execute(
                 "SELECT COUNT(*) FROM sandbox_config WHERE rollback_triggered=1"
