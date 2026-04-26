@@ -672,9 +672,9 @@ class ChangeManager:
         with self.dl._get_conn() as conn:
             conn.execute("""
                 UPDATE optimization_history
-                SET rollback_triggered = 1
+                SET rollback_triggered = 1, rollback_at = ?, rollback_reason = ?
                 WHERE batch_id = ? AND rollback_triggered = 0
-            """, (batch_id,))
+            """, (rollback_at, reason, batch_id))
 
         return {
             'rolled_back': rolled_back,
