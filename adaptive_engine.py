@@ -54,19 +54,23 @@ class AdaptiveEngine:
                 'status': 'ok' | 'warning' | 'critical',
             }
         """
-        # 实际运行日期（用于防重复和 critical 处理决策）
+        # 实际运行日期
         actual_run_date = datetime.now().strftime('%Y-%m-%d')
 
         if monitor_date is None:
             monitor_date = actual_run_date
 
-        # 判断是否是"当前监控"（数据日期=运行日期）
-        # 历史数据回补不应触发参数变更，只记录监控日志
-        is_current_monitor = (monitor_date == actual_run_date)
+        # 获取最近交易日（用于判断是否已处理 critical）
+        # 非交易日多次运行共用同一个判断基准
+        latest_trade_date = self._get_latest_trade_date()
 
-        # 防重复检查：基于实际运行日期（每天只处理一次 critical）
+        # 判断是否是"当前监控"（数据日期 >= 最近交易日）
+        # 历史数据回补不应触发参数变更
+        is_current_monitor = (monitor_date >= latest_trade_date)
+
+        # 防重复检查：基于最近交易日（交易周期内只处理一次）
         if is_current_monitor:
-            critical_already_handled = self._check_critical_already_handled(actual_run_date)
+            critical_already_handled = self._check_critical_already_handled(latest_trade_date)
         else:
             # 历史数据回补：强制跳过 critical 处理
             critical_already_handled = True
@@ -83,8 +87,8 @@ class AdaptiveEngine:
                 handled = self._handle_critical_alert(alert, monitor_date)
                 if handled:
                     critical_handled += 1
-                    # 记录已处理标记（基于实际运行日期）
-                    self._mark_critical_handled(actual_run_date, alert['type'])
+                    # 记录已处理标记（基于最近交易日）
+                    self._mark_critical_handled(latest_trade_date, alert['type'])
 
         # 确定整体状态
         if critical_alerts:
@@ -134,12 +138,12 @@ class AdaptiveEngine:
         if optimize_date is None:
             optimize_date = datetime.now().strftime('%Y-%m-%d')
 
-        # 实际运行日期
-        actual_run_date = datetime.now().strftime('%Y-%m-%d')
+        # 获取最近交易日
+        latest_trade_date = self._get_latest_trade_date()
 
-        # 判断是否是"当前优化"（数据日期=运行日期）
+        # 判断是否是"当前优化"（数据日期 >= 最近交易日）
         # 历史数据回补不应触发参数变更
-        is_current_optimize = (optimize_date == actual_run_date)
+        is_current_optimize = (optimize_date >= latest_trade_date)
 
         if not is_current_optimize:
             return {
@@ -151,11 +155,18 @@ class AdaptiveEngine:
                 'message': '历史日期不允许执行每周优化（会修改当前生产参数）',
             }
 
-        # 判断是否是周四（每周优化日）
-        dt = datetime.strptime(optimize_date, '%Y-%m-%d')
-        is_thursday = dt.weekday() == 3
+        # 判断本周周四是否是有效优化日（基于最近交易日所在周）
+        latest_dt = datetime.strptime(latest_trade_date, '%Y-%m-%d')
+        # 找到本周周四（weekday: 周一=0, 周四=3）
+        days_to_thursday = (3 - latest_dt.weekday()) % 7
+        this_week_thursday = (latest_dt + timedelta(days=days_to_thursday)).strftime('%Y-%m-%d')
 
-        if not is_thursday:
+        # 如果今天是周四，或者本周周四已过，检查本周周四是否已执行
+        current_dt = datetime.strptime(optimize_date, '%Y-%m-%d')
+        is_thursday = current_dt.weekday() == 3
+
+        # 非周四不允许执行（除非本周周四已过且未执行）
+        if not is_thursday and current_dt < datetime.strptime(this_week_thursday, '%Y-%m-%d'):
             return {
                 'optimization_results': None,
                 'sandbox_validation': None,
@@ -164,18 +175,19 @@ class AdaptiveEngine:
                 'reason': 'not_thursday',
             }
 
-        # 检查今天是否已经执行过优化（基于实际运行日期）
-        if self._check_optimization_already_run(actual_run_date):
+        # 检查本周周四是否已经执行过优化（基于本周周四日期）
+        check_date = this_week_thursday if not is_thursday else optimize_date
+        if self._check_optimization_already_run(check_date):
             return {
                 'optimization_results': None,
                 'sandbox_validation': None,
                 'applied': 0,
                 'rejected': 0,
-                'reason': 'already_run_today',
+                'reason': 'already_run_this_week',
             }
 
-        # 检查今天是否已经有新创建的 pending 记录（基于实际运行日期）
-        if self._check_has_today_pending(actual_run_date):
+        # 检查本周是否已经有新创建的 pending 记录
+        if self._check_has_today_pending(check_date):
             return {
                 'optimization_results': None,
                 'sandbox_validation': None,
@@ -444,6 +456,23 @@ class AdaptiveEngine:
 
         # 标记为已应用
         self.sandbox_validator.mark_as_applied(optimize_id)
+
+    def _get_latest_trade_date(self):
+        """
+        获取最近交易日（从 stock_daily 表查询最新数据日期）
+
+        用于判断 critical 处理是否已执行：
+        - 非交易日多次运行共用同一个判断基准
+        - 新交易日开始后才允许再次触发 critical 处理
+        """
+        with self.dl._get_conn() as conn:
+            row = conn.execute("""
+                SELECT MAX(date) FROM stock_daily
+            """).fetchone()
+            if row and row[0]:
+                return row[0]
+            # 无数据时返回今天
+            return datetime.now().strftime('%Y-%m-%d')
 
     def _check_optimization_already_run(self, optimize_date):
         """检查今天是否已经执行过每周优化（已完成验证的记录）"""
