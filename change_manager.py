@@ -214,14 +214,17 @@ class ChangeManager:
                 conn.execute("""
                     INSERT OR REPLACE INTO strategy_config
                     (param_key, param_value, description, category, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (key, value, None, None, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                    VALUES (?, ?,
+                            COALESCE((SELECT description FROM strategy_config WHERE param_key=?), ''),
+                            COALESCE((SELECT category FROM strategy_config WHERE param_key=?), 'unknown'),
+                            ?)
+                """, (key, value, key, key, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
 
             # 恢复 signal_status 状态
             for sig in signal_status:
                 conn.execute("""
                     UPDATE signal_status
-                    SET status_level = ?, weight_multiplier = ?
+                    SET status_level = ?, weight_multiplier = ?, last_check_date = datetime('now')
                     WHERE signal_type = ?
                 """, (sig.get('status_level'), sig.get('weight_multiplier'), sig.get('signal_type')))
 
