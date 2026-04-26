@@ -5,7 +5,7 @@
 
 ## 概述
 
-为 shikong_fufei 量化系统添加三层自适应优化能力：
+为 shikong_fufei 量化系统添加四层自适应优化能力：
 - **参数层**：自动优化入场/出场参数
 - **评分层**：动态调整评分权重（基于期望值）
 - **信号层**：自动启用/禁用信号类型（基于期望值+Wilson置信界）
@@ -90,8 +90,9 @@
 **环境感知逻辑：**
 
 ```python
+# [简化版 - 已废弃，生产环境请使用附录B.5的 get_market_regime_smoothed()]
 def get_market_regime(index_data, lookback=20):
-    """判断市场环境：上升期/震荡期/退潮期"""
+    """判断市场环境：上升期/震荡期/退潮期（简化版，仅供参考）"""
     # 基于 sh.000001 指数
     ma5 = index_data['close'].rolling(5).mean().iloc[-1]
     ma20 = index_data['close'].rolling(20).mean().iloc[-1]
@@ -107,11 +108,13 @@ def get_market_regime(index_data, lookback=20):
 
 **环境响应机制：**
 
-| 环境 | 活跃度系数 | 影响 |
-|------|-----------|------|
-| 上升期 | 1.0 | 正常选股，正常评分阈值 |
-| 震荡期 | 0.7 | 评分阈值提高15%，减少低分选股 |
-| 退潮期 | 0.3 | 评分阈值提高30%，仅保留高置信信号 |
+| 环境 | 活跃度系数 | 评分阈值调整公式 | 实际效果 |
+|------|-----------|------------------|----------|
+| 上升期 | 1.0 | base / 1.0 | 基准阈值不变 |
+| 震荡期 | 0.7 | base / 0.7 | 阈值提高至约1.43倍（提高43%） |
+| 退潮期 | 0.3 | base / 0.3 | 阈值提高至约3.33倍（仅保留高分信号） |
+
+**说明：** 活跃度系数越低，需要更高的评分才能入选，从而减少选股数量、提高质量门槛。
 
 **运行时机：** `daily_run.sh --track` 后自动调用
 
@@ -210,6 +213,20 @@ def wilson_expectancy_lower_bound(win_rate, avg_win, avg_loss, n, z=1.96):
   Wilson下界期望值>0 持续1周 → 向上一级恢复
   Wilson下界期望值>0.02 持续2周 → 直接恢复至active
 ```
+
+**样本阈值体系对比（信号降级 vs 沙盒验证）：**
+
+| 样本量 | 信号降级 | 沙盒验证 | 适用场景区别 |
+|--------|----------|----------|--------------|
+| <10笔 | 保持active（冷启动保护） | 使用最严格阈值×1.15 | 信号降级：不做判断；沙盒验证：可评估但要求极高 |
+| 10笔 | 可降级至watching | 开始评估，阈值×1.15 | 信号降级：首次可降级；沙盒验证：首次可决策 |
+| 20笔 | 可降级至watching | 中等阈值×1.08 | 沙盒验证放宽但信号降级仍保守 |
+| 30笔 | 可降级至warning/disabled | 正式决策，阈值×1.02 | 信号降级：可深度降级；沙盒验证：接近等效 |
+| 50笔 | 可降级至disabled | 高置信应用，阈值×0.98 | 两机制均高度可信 |
+
+**核心区别**：
+- **信号降级**：基于单个信号的期望值判断，决定是否降低权重或禁用
+- **沙盒验证**：基于参数变更后的整体表现对比，决定是否应用新参数
 
 **置信度计算（修订版）：**
 
@@ -349,7 +366,39 @@ def _make_decision(self, validation_result, sample_count):
     # 继续观察
     return 'continue', threshold_info
 ```
+
+---
+
+## 沙盒验证阈值配置
+
+沙盒验证模块使用的阈值配置定义如下：
+
+```python
+SANDBOX_VALIDATION_CONFIG = {
+    # 滚动窗口配置
+    'validation_window_weeks': 3,      # 验证窗口：3周
+    'min_validation_trades': 10,       # 最小验证交易数
+    
+    # 通过阈值（必须同时满足）
+    'pass_expectancy_threshold': 0.005, # 期望值阈值：0.5%
+    'pass_win_rate_threshold': 50,      # 胜率阈值：50%
+    
+    # 失败阈值（满足任一即失败）
+    'fail_expectancy_threshold': -0.02, # 期望值阈值：-2%
+    'fail_win_rate_threshold': 40,      # 胜率阈值：40%
+    
+    # 比较阈值
+    'improvement_threshold': 0.002,     # 相比基准提升：0.2%
+    
+    # 样本约束
+    'min_samples_per_week': 5,          # 每周最小样本数（低于此值不算有效验证周）
+}
 ```
+
+阈值说明：
+- **通过条件**：期望值 ≥ 分级阈值 且 胜率 ≥ 50% 且 有正向提升（≥0.2%）
+- **失败条件**：期望值 ≤ -2% 或 胜率 ≤ 40%
+- **中间情况**：继续观察，暂不做决策
 
 ---
 
@@ -364,6 +413,7 @@ def _make_decision(self, validation_result, sample_count):
 -- category 可选值：'entry' | 'exit' | 'scoring' | 'score_weight' | 'environment'
 
 -- 评分权重参数示例（新增category='score_weight'）：
+-- 注意：权重参数命名规则为 weight_{评分维度名}，与 SCORE_DIMENSIONS 定义对应
 INSERT INTO strategy_config (param_key, param_value, description, category, updated_at)
 VALUES
 ('weight_wave_gain', 1.0, '波段涨幅评分权重系数', 'score_weight', datetime('now')),
@@ -371,7 +421,8 @@ VALUES
 ('weight_strong_gain', 1.0, '强势涨幅评分权重系数', 'score_weight', datetime('now')),
 ('weight_volume', 1.0, '放量评分权重系数', 'score_weight', datetime('now')),
 ('weight_ma_bull', 1.0, '多头排列评分权重系数', 'score_weight', datetime('now')),
-('weight_anomaly', 1.0, '异动信号额外权重', 'score_weight', datetime('now'));
+('weight_sector', 1.0, '板块动量评分权重系数', 'score_weight', datetime('now')),
+('weight_signal_bonus', 1.0, '信号类型加分权重系数', 'score_weight', datetime('now'));
 ```
 
 ### signal_status（修订版）
@@ -483,14 +534,14 @@ CREATE TABLE IF NOT EXISTS trading_day_cache (
 **调整公式：**
 
 ```python
-def adjust_score_weight(current_weight, correlation, base_weight):
+def adjust_score_weight(current_weight, correlation, base_weight=1.0):
     """
     根据相关性调整评分权重
 
     Args:
         current_weight: 当前权重系数（相对于基准）
         correlation: Spearman相关性（评分维度与期望值）
-        base_weight: 原始基准权重值
+        base_weight: 原始基准权重值（默认1.0），作为权重回归锚点
 
     Returns:
         new_weight: 新权重系数
@@ -506,6 +557,11 @@ def adjust_score_weight(current_weight, correlation, base_weight):
     # 应用调整，带上下限
     new_weight = current_weight * (1 + delta)
     new_weight = max(0.7, min(1.5, new_weight))  # 下限-30%，上限+50%
+    
+    # 回归锚点：长期运行后权重应回归至基准附近（防止持续单向漂移）
+    # 每次调整后，向基准值微幅回归（回归系数0.05）
+    regression_factor = 0.05
+    new_weight = new_weight * (1 - regression_factor) + base_weight * regression_factor
 
     return new_weight
 
@@ -954,7 +1010,7 @@ def get_market_regime_smoothed(index_data, lookback=20, new_value_weight=0.3):
 ```python
 SANDBOX_VALIDATION_CONFIG = {
     'min_weeks_to_confirm': 3,      # 连续3周通过才应用
-    'min_samples_per_week': 5,      # 每周至少5笔新退出样本
+    'min_samples_per_week': 5,      # 每周至少5笔新退出样本（低于此值不算有效验证周）
     'rolling_window_days': 30,      # 滚动窗口30天
 }
 
@@ -962,48 +1018,98 @@ def rolling_sandbox_validate(sandbox_config, weeks_passed):
     """
     滚动窗口沙盒验证
     
-    每周运行一次，使用最近30天退出数据评估
+    每周运行一次，累计验证结果
     连续3周通过才正式应用
     使用分级阈值（见 get_sample_adjusted_threshold 函数）
+    
+    Args:
+        sandbox_config: 待验证的参数配置
+        weeks_passed: 已累计验证的周数（从 optimization_history.weeks_passed 读取）
+    
+    Returns:
+        dict: {'status': 'passed'|'evaluating'|'failed', 'details': [...]}
+    
+    注意：此函数由 run_weekly() 每周调用一次，weeks_passed 是累计值而非循环次数。
+    每次调用只计算当前周的数据，append 到历史结果中。
     """
-    results = []
+    # 取最近30天退出样本（当前周验证）
+    recent_exits = get_recent_exits(days=30)
     
-    for week in range(weeks_passed):
-        # 取最近30天退出样本
-        recent_exits = get_recent_exits(days=30)
-        sandbox_exits = apply_sandbox_config(recent_exits, sandbox_config)
-        live_exits = apply_current_config(recent_exits)
-        
-        # 本周验证结果
-        sandbox_exp = calculate_expectancy(sandbox_exits)
-        live_exp = calculate_expectancy(live_exits)
-        
-        # 使用分级阈值（见本文档"沙盒验证机制"章节的 get_sample_adjusted_threshold 函数）
-        threshold_info = get_sample_adjusted_threshold(len(sandbox_exits), live_exp)
-        required_exp = threshold_info['required_expectancy']
-        
-        week_passed = sandbox_exp >= required_exp
-        results.append({
-            'week': week + 1,
-            'passed': week_passed,
-            'sandbox_exp': sandbox_exp,
-            'live_exp': live_exp,
-            'threshold_info': threshold_info,
-        })
+    # 检查样本数是否满足最低要求
+    min_samples = SANDBOX_VALIDATION_CONFIG['min_samples_per_week']
+    if len(recent_exits) < min_samples:
+        # 样本不足，本周不算有效验证，继续 pending
+        return {
+            'status': 'evaluating',
+            'reason': f'本周样本不足({len(recent_exits)}笔<{min_samples}笔)',
+            'weeks_passed': weeks_passed,  # 不增加
+            'details': None,
+        }
     
-    # 修正：检查最近N周是否全部通过（连续通过）
+    sandbox_exits = apply_sandbox_config(recent_exits, sandbox_config)
+    live_exits = apply_current_config(recent_exits)
+    
+    # 本周验证结果
+    sandbox_exp = calculate_expectancy(sandbox_exits)
+    live_exp = calculate_expectancy(live_exits)
+    
+    # 使用分级阈值
+    threshold_info = get_sample_adjusted_threshold(len(sandbox_exits), live_exp)
+    required_exp = threshold_info['required_expectancy']
+    
+    week_passed = sandbox_exp >= required_exp
+    
+    # 读取历史验证结果（从 optimization_history）
+    history_results = get_sandbox_validation_history(sandbox_config['optimize_id'])
+    
+    # 累加本周结果
+    current_result = {
+        'week': weeks_passed + 1,
+        'passed': week_passed,
+        'sandbox_exp': sandbox_exp,
+        'live_exp': live_exp,
+        'threshold_info': threshold_info,
+        'sample_count': len(recent_exits),
+        'validated_at': datetime.now().strftime('%Y-%m-%d'),
+    }
+    all_results = history_results + [current_result]
+    
+    # 检查最近N周是否全部通过（连续通过）
     min_weeks = SANDBOX_VALIDATION_CONFIG['min_weeks_to_confirm']
-    recent_results = [r['passed'] for r in results[-min_weeks:]]
+    recent_results = [r['passed'] for r in all_results[-min_weeks:]]
     
     # all() 确保全部通过，才是"连续"
-    consecutive_all_passed = all(recent_results) and len(recent_results) >= min_weeks
+    # 同时检查样本数约束：最近N周的样本数都 >= min_samples_per_week
+    recent_samples_ok = all(r.get('sample_count', 0) >= min_samples for r in all_results[-min_weeks:])
+    consecutive_all_passed = all(recent_results) and len(recent_results) >= min_weeks and recent_samples_ok
     
     if consecutive_all_passed:
-        return {'status': 'passed', 'weeks_evaluated': len(results), 'details': results}
-    elif len(results) < min_weeks:
-        return {'status': 'evaluating', 'weeks_passed': len(results), 'details': results}
+        return {'status': 'passed', 'weeks_evaluated': len(all_results), 'details': all_results}
+    elif len(all_results) < min_weeks:
+        return {'status': 'evaluating', 'weeks_passed': len(all_results), 'details': all_results}
     else:
-        return {'status': 'failed', 'reason': '最近{}周未全部通过'.format(min_weeks), 'details': results}
+        return {'status': 'failed', 'reason': '最近{}周未全部通过'.format(min_weeks), 'details': all_results}
+
+
+def get_sandbox_validation_history(optimize_id):
+    """
+    从 optimization_history 读取历史验证结果
+    
+    Args:
+        optimize_id: optimization_history 表的记录ID
+    
+    Returns:
+        list: 历史验证结果 [{'week': 1, 'passed': True, ...}, ...]
+    """
+    # 从数据库读取 validation_details JSON 字段（需在 optimization_history 表新增）
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT validation_details FROM optimization_history WHERE id=?
+        """, (optimize_id,)).fetchone()
+    
+    if row and row[0]:
+        return json.loads(row[0])
+    return []
 ```
 
 ---
@@ -1122,15 +1228,18 @@ class StrategyConfig:
     # 现有 DEFAULTS 不变
     
     # 新增：动态参数注册表
+    # 元组格式：(默认值, category, description)
+    # 注意：category在第2位，description在第3位（与SQL示例顺序不同，请参考set()方法读取逻辑）
     DYNAMIC_PARAMS = {
         # score_weight 类参数
-        'weight_wave_gain': (1.0, '波段涨幅评分权重系数', 'score_weight'),
-        'weight_shallow_dd': (1.0, '浅回调评分权重系数', 'score_weight'),
-        'weight_strong_gain': (1.0, '强势涨幅评分权重系数', 'score_weight'),
-        'weight_volume': (1.0, '放量评分权重系数', 'score_weight'),
-        'weight_ma_bull': (1.0, '多头排列评分权重系数', 'score_weight'),
-        'weight_anomaly': (1.0, '异动信号额外权重', 'score_weight'),
-        'weight_sector': (1.0, '板块动量权重', 'score_weight'),
+        # 权重命名规则：weight_{评分维度名}，与 normalizer.py 的 SCORE_DIMENSIONS 对应
+        'weight_wave_gain': (1.0, 'score_weight', '波段涨幅评分权重系数'),
+        'weight_shallow_dd': (1.0, 'score_weight', '浅回调评分权重系数'),
+        'weight_strong_gain': (1.0, 'score_weight', '强势涨幅评分权重系数'),
+        'weight_volume': (1.0, 'score_weight', '放量评分权重系数'),
+        'weight_ma_bull': (1.0, 'score_weight', '多头排列评分权重系数'),
+        'weight_sector': (1.0, 'score_weight', '板块动量评分权重系数'),
+        'weight_signal_bonus': (1.0, 'score_weight', '信号类型加分权重系数'),
         
         # environment 类参数
         'activity_coefficient': (1.0, '当前环境活跃度系数', 'environment'),
@@ -1779,3 +1888,20 @@ def _cache_trading_day(self, date, is_trading_day, data_available):
 | 沙盒验证缺少trading_day_cache表 | 新增表定义和缓存策略 | 正文447-459行后 |
 | 滚动验证缺少分级阈值集成 | 新增 threshold_info 调用 | B.6 |
 | 架构图遗漏 normalizer 模块 | 新增归一化模块和 trading_day_cache 表 | 正文18-51行 |
+
+---
+
+### B.17 修订汇总（第七轮）
+
+| 评审问题 | 严重程度 | 解决方案 | 章节 |
+|----------|----------|----------|------|
+| 概述说"三层"但列了四层 | 轻微 | 改为"四层自适应优化能力" | 正文第8行 |
+| 环境判断函数两个版本未指明权威版本 | 中等 | 标注简化版为[已废弃]，指向B.5增强版 | 正文92-106行 |
+| 环境阈值调整公式与描述不一致 | 严重 | 更正表格：震荡期提高43%，退潮期提高233% | 正文110-114行 |
+| adjust_score_weight未使用base_weight参数 | 严重 | 新增回归锚点逻辑，防止权重单向漂移 | 正文493-513行 |
+| weight_anomaly与weight_signal_bonus键名冲突 | 中等 | 统一为weight_signal_bonus，与SCORE_DIMENSIONS对应 | 正文377行、B.8 |
+| DYNAMIC_PARAMS元组字段顺序未注释 | 轻微 | 新增元组格式注释：(value, category, description) | B.8 |
+| _make_decision引用未定义的配置项 | 中等 | 新增沙盒验证阈值配置章节，明确各阈值数值 | 正文355行后新增章节 |
+| min_samples_per_week定义但未使用 | 中等 | 在验证逻辑中新增样本数约束检查 | B.6 |
+| 滚动窗口循环无意义（week变量未使用） | 严重 | 重构为累计验证模式，每次调用只算当前周 | B.6 |
+| 信号降级与沙盒验证阈值易混淆 | 轻微 | 新增对比表格，明确适用场景区别 | 正文195-215行后 |
