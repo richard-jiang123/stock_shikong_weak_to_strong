@@ -1275,6 +1275,56 @@ class TestChangeManager(unittest.TestCase):
 
         self.assertEqual(trace['found'], False)
 
+    # ─────────────────────────────────────────────
+    # 集成测试
+    # ─────────────────────────────────────────────
+
+    def test_weekly_optimizer_integration(self):
+        """测试 WeeklyOptimizer 能正常初始化 ChangeManager"""
+        from weekly_optimizer import WeeklyOptimizer
+
+        opt = WeeklyOptimizer(self.db_path)
+
+        # 验证 change_mgr 已初始化
+        self.assertTrue(hasattr(opt, 'change_mgr'))
+        self.assertIsNotNone(opt.change_mgr)
+
+        # 验证能生成 batch_id
+        batch_id = opt.change_mgr.generate_batch_id('20260426')
+        self.assertEqual(batch_id, '20260426-001')
+
+    def test_sandbox_validator_integration(self):
+        """测试 SandboxValidator 能正常初始化 ChangeManager"""
+        from sandbox_validator import SandboxValidator
+
+        validator = SandboxValidator(self.db_path)
+
+        # 验证 change_mgr 已初始化
+        self.assertTrue(hasattr(validator, 'change_mgr'))
+        self.assertIsNotNone(validator.change_mgr)
+
+        # 验证 validate_batch 方法存在
+        self.assertTrue(hasattr(validator, 'validate_batch'))
+
+    def test_adaptive_engine_integration(self):
+        """测试 AdaptiveEngine 能正常初始化 ChangeManager"""
+        from adaptive_engine import AdaptiveEngine
+
+        engine = AdaptiveEngine(self.db_path)
+
+        # 验证 change_mgr 已初始化
+        self.assertTrue(hasattr(engine, 'change_mgr'))
+        self.assertIsNotNone(engine.change_mgr)
+
+        # 验证 monitor_and_rollback 方法被调用
+        # 添加一些测试数据
+        self.mgr.save_snapshot('weekly_optimize', 'test-batch', 'pre_change')
+        self.mgr.stage_change('strategy_config', 'first_wave_min_days', 5, 'test-batch')
+        self.mgr.commit_change(self.mgr.get_staged_params('test-batch')[0]['id'])
+
+        result = engine.run_daily()
+        self.assertIn('rollback_monitor', result)
+
 
 if __name__ == '__main__':
     unittest.main()
