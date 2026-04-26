@@ -238,6 +238,9 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
     cfg = StrategyConfig()
     weights = cfg.get_weights()
 
+    # 预查询历史统计（避免循环内重复查询）
+    history_stats, history_meta = normalizer.get_history_stats()
+
     results = []
     for i, code in enumerate(filtered_codes):
         if code not in kline_cache:
@@ -268,8 +271,10 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
                 'signal_bonus': score_details.get('score_signal_bonus', 0),
             }
 
-            # 应用归一化
-            normalized_score, norm_meta = normalizer.normalize_scores(scores_dict, weights)
+            # 应用归一化（使用预缓存的历史统计）
+            normalized_score, norm_meta = normalizer.normalize_scores_with_cached_stats(
+                scores_dict, weights, history_stats, history_meta
+            )
             score_base = score_details.get('score_base', 5)
             total_score = score_base + normalized_score
 

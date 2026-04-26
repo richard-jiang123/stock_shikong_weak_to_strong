@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 评分归一化模块
 
@@ -164,6 +165,61 @@ class ScoreNormalizer:
         normalized_score = weighted_total * scale_factor
 
         # 7. 补充meta信息
+        meta['scale_factor'] = scale_factor
+        meta['weighted_total_raw'] = weighted_total
+        meta['global_base_total'] = global_base_total
+        meta['global_weighted_total'] = global_weighted_total
+
+        return normalized_score, meta
+
+    def normalize_scores_with_cached_stats(self, scores_dict, weights_dict, history_stats, history_meta):
+        """
+        使用预缓存的历史统计进行归一化（避免重复数据库查询）
+
+        Args:
+            scores_dict: 当前股票各维度评分 {'day_gain': 10, 'wave_gain': 20, ...}
+            weights_dict: 当前权重 {'weight_strong_gain': 1.0, 'weight_wave_gain': 1.2, ...}
+            history_stats: 预计算的历史统计 dict
+            history_meta: 预计算的历史元数据 dict
+
+        Returns:
+            normalized_score: float 归一化后总分（不含score_base）
+            meta: dict 包含 scale_factor 等信息
+        """
+        # 维度名到权重键名的映射
+        DIMENSION_TO_WEIGHT = {
+            'day_gain': 'weight_strong_gain',
+        }
+
+        # 计算当前股票加权总分
+        weighted_total = 0
+        for dim in SCORE_DIMENSIONS:
+            score_val = scores_dict.get(dim, 0)
+            weight_key = DIMENSION_TO_WEIGHT.get(dim, f'weight_{dim}')
+            weight_val = weights_dict.get(weight_key, 1.0)
+            weighted_total += score_val * weight_val
+
+        # 计算全局基准总分（权重=1.0）
+        global_base_total = sum(
+            history_stats.get(f'avg_{dim}', 10.0) for dim in SCORE_DIMENSIONS
+        )
+
+        # 计算全局加权总分（当前权重）
+        global_weighted_total = 0
+        for dim in SCORE_DIMENSIONS:
+            avg_val = history_stats.get(f'avg_{dim}', 10.0)
+            weight_key = DIMENSION_TO_WEIGHT.get(dim, f'weight_{dim}')
+            weight_val = weights_dict.get(weight_key, 1.0)
+            global_weighted_total += avg_val * weight_val
+
+        # 缩放因子
+        scale_factor = global_base_total / global_weighted_total if global_weighted_total > 0 else 1.0
+
+        # 归一化得分
+        normalized_score = weighted_total * scale_factor
+
+        # 构建 meta（复制 history_meta 并添加计算结果）
+        meta = history_meta.copy()
         meta['scale_factor'] = scale_factor
         meta['weighted_total_raw'] = weighted_total
         meta['global_base_total'] = global_base_total

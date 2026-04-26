@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 归一化模块单元测试
 """
-import pytest
+try:
+    import pytest
+except ImportError:
+    pytest = None  # pytest 可选，测试仍可手动运行
 import sqlite3
 import pandas as pd
 from datetime import datetime
@@ -281,3 +285,39 @@ class TestNormalizeScores:
         # 缺失维度视为0分（共7个维度）
         expected_weighted = 20 + 15 + 0 + 0 + 0 + 0 + 0  # 35
         assert meta['weighted_total_raw'] == expected_weighted
+
+    def test_normalize_with_cached_stats_same_result(self):
+        """使用缓存统计应与直接调用结果一致"""
+        scores = {
+            'day_gain': 10,
+            'wave_gain': 20,
+            'shallow_dd': 15,
+            'volume': 5,
+            'ma_bull': 10,
+            'sector': 0,
+            'signal_bonus': 10,
+        }
+        weights = {
+            'weight_strong_gain': 1.0,
+            'weight_wave_gain': 1.0,
+            'weight_shallow_dd': 1.0,
+            'weight_volume': 1.0,
+            'weight_ma_bull': 1.0,
+            'weight_sector': 1.0,
+            'weight_signal_bonus': 1.0,
+        }
+
+        dl = self._create_mock_data_layer_empty()
+        normalizer = ScoreNormalizer(data_layer=dl)
+
+        # 直接调用
+        normalized1, meta1 = normalizer.normalize_scores(scores, weights)
+
+        # 预缓存后调用
+        history_stats, history_meta = normalizer.get_history_stats()
+        normalized2, meta2 = normalizer.normalize_scores_with_cached_stats(
+            scores, weights, history_stats, history_meta
+        )
+
+        assert normalized1 == normalized2
+        assert meta1['scale_factor'] == meta2['scale_factor']
