@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_layer import get_data_layer, StockDataLayer
 from strategy_config import StrategyConfig
 from signal_constants import SANDBOX_STATUS
+from change_manager import ChangeManager
 
 
 # 沙盒验证配置
@@ -45,6 +46,7 @@ class SandboxValidator:
             self.dl = StockDataLayer(db_path)
         self.cfg = StrategyConfig(db_path)
         self.config = SANDBOX_VALIDATION_CONFIG
+        self.change_mgr = ChangeManager(db_path)
 
     def validate_optimization(self, optimize_id=None, optimize_date=None, optimize_type=None):
         """
@@ -170,6 +172,121 @@ class SandboxValidator:
                 'metrics': validation_result['metrics'],
                 'decision': 'continue_monitoring',
             }
+
+    def validate_batch(self, batch_id=None):
+        """
+        验证批次变更（使用ChangeManager）
+
+        Args:
+            batch_id: 批次ID，如果为None则验证所有待处理批次
+
+        Returns:
+            dict: {
+                'status': 'batch_complete' | 'no_pending',
+                'validated': int,
+                'passed': int,
+                'failed': int,
+                'details': list
+            }
+        """
+        if batch_id:
+            staged = self.change_mgr.get_staged_params(batch_id)
+        else:
+            all_batches = self.change_mgr.get_all_staged_batches()
+            staged = []
+            for batch in all_batches:
+                staged.extend(self.change_mgr.get_staged_params(batch['batch_id']))
+
+        if not staged:
+            return {'status': 'no_pending', 'validated': 0}
+
+        # 更新状态为 validating
+        for item in staged:
+            self.change_mgr.update_status(item['id'], 'validating')
+
+        # 执行验证逻辑
+        results = []
+        for item in staged:
+            validation = self._validate_single_sandbox(item)
+
+            if validation['passed']:
+                self.change_mgr.update_status(item['id'], 'passed')
+            else:
+                self.change_mgr.reject_change(item['id'], validation['reason'])
+
+            results.append({
+                'sandbox_id': item['id'],
+                'param_key': item['param_key'],
+                'passed': validation['passed'],
+                'reason': validation.get('reason'),
+            })
+
+        passed_count = sum(1 for r in results if r['passed'])
+
+        return {
+            'status': 'batch_complete',
+            'validated': len(results),
+            'passed': passed_count,
+            'failed': len(results) - passed_count,
+            'details': results,
+        }
+
+    def _validate_single_sandbox(self, item):
+        """
+        验证单个沙盒变更
+
+        Args:
+            item: sandbox_config记录 (from get_staged_params)
+
+        Returns:
+            dict: {'passed': bool, 'reason': str}
+        """
+        optimize_type = item['optimize_type']
+        param_key = item['param_key']
+        new_value = item['sandbox_value']
+
+        # 计算验证窗口
+        validation_end = datetime.now().strftime('%Y-%m-%d')
+        validation_start = (datetime.now() - timedelta(weeks=self.config['validation_window_weeks'])).strftime('%Y-%m-%d')
+
+        # 使用现有的 _evaluate_validation 方法
+        validation_result = self._evaluate_validation(
+            optimize_type, param_key, new_value,
+            validation_start, validation_end
+        )
+
+        if validation_result is None:
+            # 数据不足，保持 pending 状态
+            return {'passed': False, 'reason': 'insufficient_data'}
+
+        decision = self._make_decision(validation_result)
+
+        if decision == 'pass':
+            return {'passed': True, 'reason': 'validation_passed'}
+        elif decision == 'fail':
+            return {'passed': False, 'reason': 'validation_failed'}
+        else:
+            return {'passed': False, 'reason': 'continue_monitoring'}
+
+    def apply_passed_changes(self, batch_id: str):
+        """
+        应用通过验证的变更
+
+        Args:
+            batch_id: 批次ID
+
+        Returns:
+            dict: {'applied': int}
+        """
+        staged = self.change_mgr.get_staged_params(batch_id)
+
+        applied = 0
+        for item in staged:
+            if item['status'] == 'passed':
+                if self.change_mgr.commit_change(item['id']):
+                    applied += 1
+
+        return {'applied': applied}
 
     def _batch_validate_pending(self):
         """批量验证所有待验证记录"""

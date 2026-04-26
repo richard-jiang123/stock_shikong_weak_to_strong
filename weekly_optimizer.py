@@ -14,6 +14,7 @@ from strategy_config import StrategyConfig
 from strategy_optimizer import StrategyOptimizer
 from signal_constants import SIGNAL_TYPE_MAPPING, get_weight_multiplier
 from normalizer import ScoreNormalizer, SCORE_DIMENSIONS
+from change_manager import ChangeManager
 
 
 def adjust_score_weight(current_weight, correlation, base_weight=1.0):
@@ -98,6 +99,7 @@ class WeeklyOptimizer:
             self.dl = StockDataLayer(db_path)
         self.cfg = StrategyConfig(db_path)
         self.optimizer = StrategyOptimizer(db_path)
+        self.change_mgr = ChangeManager(db_path)
 
     def run(self, optimize_date=None, layers=None):
         """
@@ -116,23 +118,67 @@ class WeeklyOptimizer:
         if layers is None:
             layers = ['params', 'score_weights', 'signal_status', 'environment']
 
+        # 生成批次ID并保存快照
+        batch_id = self.change_mgr.generate_batch_id(optimize_date.replace('-', ''))
+        snapshot_id = self.change_mgr.save_snapshot(
+            trigger_reason='weekly_optimize',
+            batch_id=batch_id
+        )
         results = {}
+        results['batch_id'] = batch_id
+        results['snapshot_id'] = snapshot_id
 
         # 1. 参数层优化
         if 'params' in layers:
             results['params'] = self._optimize_params_layer(optimize_date)
+            # 暂存参数变更
+            for key, change in results['params'].get('changes', {}).items():
+                self.change_mgr.stage_change(
+                    optimize_type='strategy_config',
+                    param_key=key,
+                    new_value=change['new'],
+                    batch_id=batch_id,
+                    current_value=change['old']
+                )
 
         # 2. 评分层优化
         if 'score_weights' in layers:
             results['score_weights'] = self._optimize_score_weights_layer(optimize_date)
+            # 暂存权重变更
+            for key, change in results['score_weights'].get('weight_changes', {}).items():
+                self.change_mgr.stage_change(
+                    optimize_type='strategy_config',
+                    param_key=key,
+                    new_value=change['new'],
+                    batch_id=batch_id,
+                    current_value=change['old']
+                )
 
         # 3. 信号层优化
         if 'signal_status' in layers:
             results['signal_status'] = self._optimize_signal_status_layer(optimize_date)
+            # 暂存信号状态变更
+            for signal_type, change in results['signal_status'].get('status_changes', {}).items():
+                self.change_mgr.stage_change(
+                    optimize_type='signal_status',
+                    param_key=signal_type,
+                    new_value=change['new_status'],
+                    batch_id=batch_id,
+                    current_value=change['old_status']
+                )
 
         # 4. 环境层优化
         if 'environment' in layers:
             results['environment'] = self._optimize_environment_layer(optimize_date)
+            # 暂存环境参数变更
+            for key, change in results['environment'].get('threshold_updates', {}).items():
+                self.change_mgr.stage_change(
+                    optimize_type='strategy_config',
+                    param_key=key,
+                    new_value=change['new'],
+                    batch_id=batch_id,
+                    current_value=change['old']
+                )
 
         # 记录优化历史
         self._record_optimization_history(results, optimize_date)
@@ -508,48 +554,59 @@ class WeeklyOptimizer:
 
     def _record_optimization_history(self, results, optimize_date):
         """记录优化历史"""
+        batch_id = results.get('batch_id')
+        snapshot_id = results.get('snapshot_id')
         with self.dl._get_conn() as conn:
             for layer, result in results.items():
+                # Skip batch_id and snapshot_id entries
+                if layer in ('batch_id', 'snapshot_id'):
+                    continue
                 if result.get('optimized') or result.get('adjusted'):
                     # 记录主要参数变化
                     if layer == 'params':
                         for key, change in result.get('changes', {}).items():
                             conn.execute("""
                                 INSERT INTO optimization_history
-                                (optimize_date, optimize_type, param_key, old_value, new_value, created_at)
-                                VALUES (?, ?, ?, ?, ?, datetime('now'))
-                            """, (optimize_date, layer, key, change['old'], change['new']))
+                                (optimize_date, optimize_type, param_key, old_value, new_value, batch_id, snapshot_id, trigger_reason, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 'weekly_optimize', datetime('now'))
+                            """, (optimize_date, layer, key, change['old'], change['new'], batch_id, snapshot_id))
 
                     elif layer == 'score_weights':
                         for key, change in result.get('weight_changes', {}).items():
                             conn.execute("""
                                 INSERT INTO optimization_history
-                                (optimize_date, optimize_type, param_key, old_value, new_value, created_at)
-                                VALUES (?, ?, ?, ?, ?, datetime('now'))
-                            """, (optimize_date, layer, key, change['old'], change['new']))
+                                (optimize_date, optimize_type, param_key, old_value, new_value, batch_id, snapshot_id, trigger_reason, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 'weekly_optimize', datetime('now'))
+                            """, (optimize_date, layer, key, change['old'], change['new'], batch_id, snapshot_id))
 
                     elif layer == 'signal_status':
                         for signal_type, change in result.get('status_changes', {}).items():
                             conn.execute("""
                                 INSERT INTO optimization_history
-                                (optimize_date, optimize_type, param_key, old_value, new_value, created_at)
-                                VALUES (?, ?, ?, ?, ?, datetime('now'))
-                            """, (optimize_date, layer, signal_type, change['old_status'], change['new_status']))
+                                (optimize_date, optimize_type, param_key, old_value, new_value, batch_id, snapshot_id, trigger_reason, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 'weekly_optimize', datetime('now'))
+                            """, (optimize_date, layer, signal_type, change['old_status'], change['new_status'], batch_id, snapshot_id))
 
                     elif layer == 'environment':
                         for key, change in result.get('threshold_updates', {}).items():
                             conn.execute("""
                                 INSERT INTO optimization_history
-                                (optimize_date, optimize_type, param_key, old_value, new_value, created_at)
-                                VALUES (?, ?, ?, ?, ?, datetime('now'))
-                            """, (optimize_date, layer, key, change['old'], change['new']))
+                                (optimize_date, optimize_type, param_key, old_value, new_value, batch_id, snapshot_id, trigger_reason, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 'weekly_optimize', datetime('now'))
+                            """, (optimize_date, layer, key, change['old'], change['new'], batch_id, snapshot_id))
 
     def print_summary(self, results, optimize_date=None):
         """打印优化摘要"""
         date_str = optimize_date if optimize_date else datetime.now().strftime('%Y-%m-%d')
+        batch_id = results.get('batch_id')
         print(f"\n[每周优化] {date_str}")
+        if batch_id:
+            print(f"  批次ID: {batch_id}  快照ID: {results.get('snapshot_id')}")
 
         for layer, result in results.items():
+            # Skip batch_id and snapshot_id entries
+            if layer in ('batch_id', 'snapshot_id'):
+                continue
             layer_desc = self.OPTIMIZATION_LAYERS[layer]['description']
             print(f"\n  [{layer}] {layer_desc}")
 

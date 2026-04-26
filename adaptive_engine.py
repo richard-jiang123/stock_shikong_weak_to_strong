@@ -13,6 +13,7 @@ from strategy_config import StrategyConfig
 from daily_monitor import DailyMonitor
 from weekly_optimizer import WeeklyOptimizer
 from sandbox_validator import SandboxValidator
+from change_manager import ChangeManager
 
 
 class AdaptiveEngine:
@@ -37,6 +38,7 @@ class AdaptiveEngine:
         self.monitor = DailyMonitor(db_path)
         self.weekly_optimizer = WeeklyOptimizer(db_path)
         self.sandbox_validator = SandboxValidator(db_path)
+        self.change_mgr = ChangeManager(db_path)
 
     def run_daily(self, monitor_date=None):
         """
@@ -81,10 +83,17 @@ class AdaptiveEngine:
         else:
             status = 'ok'
 
+        # 主动回滚监控
+        rollback_result = self.change_mgr.monitor_and_rollback()
+
+        if rollback_result['rollback_triggered'] > 0:
+            self._notify_rollback_result(rollback_result)
+
         return {
             'alerts': alerts,
             'critical_handled': critical_handled,
             'status': status,
+            'rollback_monitor': rollback_result,
         }
 
     def run_weekly(self, optimize_date=None, layers=None):
@@ -370,6 +379,16 @@ class AdaptiveEngine:
                 WHERE optimize_date=? AND sandbox_test_result = 'pending'
             """, (optimize_date,)).fetchone()[0]
         return count > 0
+
+    def _notify_rollback_result(self, rollback_result):
+        """通知回滚结果"""
+        for detail in rollback_result['details']:
+            if detail['should_rollback']:
+                batch_id = detail['batch_id']
+                reason = detail['reason']
+
+                print(f"\n[自动回滚] 批次 {batch_id}")
+                print(f"  原因: {reason}")
 
     def get_status_summary(self):
         """
