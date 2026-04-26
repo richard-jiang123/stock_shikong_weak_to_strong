@@ -110,3 +110,63 @@ class ScoreNormalizer:
             else:
                 stats[f'avg_{dim}'] = 10.0  # 默认值（历史均值未知时的保守估计）
         return stats
+
+    def normalize_scores(self, scores_dict, weights_dict):
+        """
+        归一化评分
+
+        核心公式：
+        scale_factor = global_base_total / global_weighted_total
+        normalized_score = weighted_total * scale_factor
+
+        Args:
+            scores_dict: 当前股票各维度评分 {'day_gain': 10, 'wave_gain': 20, ...}
+            weights_dict: 当前权重 {'weight_strong_gain': 1.0, 'weight_wave_gain': 1.2, ...}
+
+        Returns:
+            normalized_score: float 归一化后总分（不含score_base）
+            meta: dict {'method': ..., 'confidence': ..., 'n': ..., 'scale_factor': ...}
+        """
+        # 维度名到权重键名的映射（因为 day_gain 对应 weight_strong_gain）
+        DIMENSION_TO_WEIGHT = {
+            'day_gain': 'weight_strong_gain',  # 特殊映射
+        }
+
+        # 1. 获取历史统计
+        history_stats, meta = self.get_history_stats()
+
+        # 2. 计算当前股票加权总分
+        weighted_total = 0
+        for dim in SCORE_DIMENSIONS:
+            score_val = scores_dict.get(dim, 0)
+            # 查找对应的权重键名
+            weight_key = DIMENSION_TO_WEIGHT.get(dim, f'weight_{dim}')
+            weight_val = weights_dict.get(weight_key, 1.0)
+            weighted_total += score_val * weight_val
+
+        # 3. 计算全局基准总分（权重=1.0）
+        global_base_total = sum(
+            history_stats.get(f'avg_{dim}', 10.0) for dim in SCORE_DIMENSIONS
+        )
+
+        # 4. 计算全局加权总分（当前权重）
+        global_weighted_total = 0
+        for dim in SCORE_DIMENSIONS:
+            avg_val = history_stats.get(f'avg_{dim}', 10.0)
+            weight_key = DIMENSION_TO_WEIGHT.get(dim, f'weight_{dim}')
+            weight_val = weights_dict.get(weight_key, 1.0)
+            global_weighted_total += avg_val * weight_val
+
+        # 5. 缩放因子（避免除零）
+        scale_factor = global_base_total / global_weighted_total if global_weighted_total > 0 else 1.0
+
+        # 6. 归一化得分
+        normalized_score = weighted_total * scale_factor
+
+        # 7. 补充meta信息
+        meta['scale_factor'] = scale_factor
+        meta['weighted_total_raw'] = weighted_total
+        meta['global_base_total'] = global_base_total
+        meta['global_weighted_total'] = global_weighted_total
+
+        return normalized_score, meta
