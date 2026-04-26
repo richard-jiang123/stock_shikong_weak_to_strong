@@ -173,13 +173,13 @@ class ChangeManager:
 
         return snapshot_id
 
-    def restore_snapshot(self, snapshot_id: int, restore_reason: str = None) -> bool:
+    def restore_snapshot(self, snapshot_id: int, reason: str = None) -> bool:
         """
         从快照恢复参数（原子操作）
 
         Args:
             snapshot_id: 快照ID
-            restore_reason: 恢复原因说明
+            reason: 恢复原因说明
 
         Returns:
             bool: 是否恢复成功
@@ -187,12 +187,16 @@ class ChangeManager:
         # 1. 先在事务外读取快照数据（避免长事务）
         with self.dl._get_conn() as conn:
             row = conn.execute("""
-                SELECT params_json, signal_status_json, environment_json
+                SELECT params_json, signal_status_json, environment_json, is_restored
                 FROM param_snapshot
                 WHERE id = ?
             """, (snapshot_id,)).fetchone()
 
         if row is None:
+            return False
+
+        # Check if already restored
+        if row[3] == 1:
             return False
 
         params_json = row[0]
@@ -221,12 +225,25 @@ class ChangeManager:
                     WHERE signal_type = ?
                 """, (sig.get('status_level'), sig.get('weight_multiplier'), sig.get('signal_type')))
 
+            restored_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # 恢复 environment 参数
+            for key, value in environment_dict.items():
+                conn.execute("""
+                    INSERT OR REPLACE INTO strategy_config
+                    (param_key, param_value, description, category, updated_at)
+                    VALUES (?, ?,
+                            COALESCE((SELECT description FROM strategy_config WHERE param_key=?), ''),
+                            COALESCE((SELECT category FROM strategy_config WHERE param_key=?), 'environment'),
+                            ?)
+                """, (key, value, key, key, restored_at))
+
             # 标记快照已恢复
             conn.execute("""
                 UPDATE param_snapshot
                 SET is_restored = 1, restored_at = ?, restore_reason = ?
                 WHERE id = ?
-            """, (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), restore_reason, snapshot_id))
+            """, (restored_at, reason, snapshot_id))
 
         return True
 
@@ -247,7 +264,7 @@ class ChangeManager:
                            params_json, signal_status_json, environment_json,
                            is_restored, restored_at, restore_reason, created_at
                     FROM param_snapshot
-                    WHERE batch_id = ?
+                    WHERE batch_id = ? AND is_restored = 0
                     ORDER BY id DESC
                     LIMIT 1
                 """, (batch_id,)).fetchone()
@@ -258,7 +275,7 @@ class ChangeManager:
                            params_json, signal_status_json, environment_json,
                            is_restored, restored_at, restore_reason, created_at
                     FROM param_snapshot
-                    WHERE snapshot_type = 'pre_change'
+                    WHERE snapshot_type = 'pre_change' AND is_restored = 0
                     ORDER BY id DESC
                     LIMIT 1
                 """).fetchone()
@@ -272,9 +289,9 @@ class ChangeManager:
             'snapshot_type': row[2],
             'batch_id': row[3],
             'trigger_reason': row[4],
-            'params_json': row[5],
-            'signal_status_json': row[6],
-            'environment_json': row[7],
+            'params': json.loads(row[5]) if row[5] else {},
+            'signal_status': json.loads(row[6]) if row[6] else [],
+            'environment': json.loads(row[7]) if row[7] else {},
             'is_restored': row[8],
             'restored_at': row[9],
             'restore_reason': row[10],
@@ -309,9 +326,9 @@ class ChangeManager:
             'snapshot_type': row[2],
             'batch_id': row[3],
             'trigger_reason': row[4],
-            'params_json': row[5],
-            'signal_status_json': row[6],
-            'environment_json': row[7],
+            'params': json.loads(row[5]) if row[5] else {},
+            'signal_status': json.loads(row[6]) if row[6] else [],
+            'environment': json.loads(row[7]) if row[7] else {},
             'is_restored': row[8],
             'restored_at': row[9],
             'restore_reason': row[10],

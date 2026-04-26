@@ -79,26 +79,23 @@ class TestChangeManager(unittest.TestCase):
         self.assertEqual(snapshot['trigger_reason'], 'weekly_optimize')
         self.assertEqual(snapshot['batch_id'], 'batch_20260426_001')
         self.assertEqual(snapshot['snapshot_type'], 'pre_change')
-        self.assertIsNotNone(snapshot['params_json'])
-        self.assertIsNotNone(snapshot['signal_status_json'])
-        self.assertIsNotNone(snapshot['environment_json'])
+        self.assertIsNotNone(snapshot['params'])
+        self.assertIsNotNone(snapshot['signal_status'])
+        self.assertIsNotNone(snapshot['environment'])
 
-        # 验证 params_json 包含预期参数
-        import json
-        params = json.loads(snapshot['params_json'])
+        # 验证 params 包含预期参数
+        params = snapshot['params']
         self.assertIn('first_wave_min_days', params)
         self.assertIn('stop_loss_buffer', params)
 
-        # 验证 signal_status_json 包含信号状态
-        signal_status = json.loads(snapshot['signal_status_json'])
+        # 验证 signal_status 包含信号状态
+        signal_status = snapshot['signal_status']
         self.assertEqual(len(signal_status), 4)
         signal_types = [s['signal_type'] for s in signal_status]
         self.assertIn('anomaly_no_decline', signal_types)
 
     def test_restore_snapshot(self):
         """测试：从快照恢复参数"""
-        import json
-
         # 1. 保存初始快照
         snapshot_id = self.mgr.save_snapshot(
             trigger_reason='manual',
@@ -121,7 +118,7 @@ class TestChangeManager(unittest.TestCase):
         self.assertEqual(self.cfg.get('stop_loss_buffer'), 0.05)
 
         # 4. 从快照恢复
-        result = self.mgr.restore_snapshot(snapshot_id, restore_reason='test_restore')
+        result = self.mgr.restore_snapshot(snapshot_id, reason='test_restore')
         self.assertTrue(result)
 
         # 5. 创建新的 StrategyConfig 实例读取数据库，验证恢复
@@ -176,6 +173,36 @@ class TestChangeManager(unittest.TestCase):
             self.assertIsNone(result)
         finally:
             os.unlink(empty_db_path)
+
+    def test_restore_snapshot_already_restored(self):
+        """测试：已恢复的快照不能再次恢复"""
+        # 1. 保存快照
+        snapshot_id = self.mgr.save_snapshot(
+            trigger_reason='manual',
+            snapshot_type='pre_change'
+        )
+
+        # 2. 第一次恢复应该成功
+        result1 = self.mgr.restore_snapshot(snapshot_id, reason='first_restore')
+        self.assertTrue(result1)
+
+        # 3. 第二次恢复应该失败（已标记为已恢复）
+        result2 = self.mgr.restore_snapshot(snapshot_id, reason='second_restore')
+        self.assertFalse(result2)
+
+    def test_get_latest_snapshot_filters_restored(self):
+        """测试：get_latest_snapshot 过滤已恢复的快照"""
+        # 1. 保存多个快照
+        id1 = self.mgr.save_snapshot('manual', None, 'pre_change')
+        id2 = self.mgr.save_snapshot('manual', None, 'pre_change')
+
+        # 2. 恢复 id2（最新的快照）
+        self.mgr.restore_snapshot(id2, reason='test')
+
+        # 3. get_latest_snapshot 应该返回 id1（因为 id2 已被标记为已恢复）
+        latest = self.mgr.get_latest_snapshot()
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest['id'], id1)
 
 
 if __name__ == '__main__':
