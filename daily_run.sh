@@ -72,19 +72,25 @@ acquire_lock() {
     local lock_name="$1"
     local timeout="${2:-60}"
 
-    # 启动锁子进程（不重定向 stdin）
-    python3 "${SCRIPT_DIR}/process_lock.py" --acquire "${lock_name}" --timeout "${timeout}" &
+    # 创建临时文件用于捕获子进程输出
+    local output_file=$(mktemp)
+
+    # 启动锁子进程（捕获输出到临时文件）
+    python3 "${SCRIPT_DIR}/process_lock.py" --acquire "${lock_name}" --timeout "${timeout}" > "$output_file" 2>&1 &
     LOCK_PID=$!
 
-    # 等待子进程启动并检查存活
+    # 等待子进程启动并获取结果
     sleep 1
 
-    # 用 kill -0 检查进程存活（不发信号，只检查）
+    # 检查子进程状态和输出
     if ! kill -0 "$LOCK_PID" 2>/dev/null; then
-        # 进程已退出，等待获取退出码
+        # 进程已退出，读取输出判断原因
         wait "$LOCK_PID" 2>/dev/null
         local exit_code=$?
-        if [ $exit_code -eq 1 ]; then
+        local output=$(cat "$output_file" 2>/dev/null)
+        rm -f "$output_file"
+
+        if [[ "$output" == *"LOCK_TIMEOUT"* ]] || [ $exit_code -eq 1 ]; then
             log "  ✗ 获取锁超时，可能有其他实例正在运行"
         else
             log "  ✗ 锁进程异常退出 (exit=${exit_code})"
@@ -93,7 +99,36 @@ acquire_lock() {
         exit 1
     fi
 
-    log "  锁已获取 (PID=${LOCK_PID})"
+    # 子进程存活，检查是否真正获取了锁（输出 LOCK_ACQUIRED）
+    local output=$(cat "$output_file" 2>/dev/null)
+    if [[ "$output" == *"LOCK_ACQUIRED"* ]]; then
+        rm -f "$output_file"
+        log "  锁已获取 (PID=${LOCK_PID})"
+    else
+        # 子进程还在等待锁，但尚未获取成功
+        # 等待一小段时间再检查
+        sleep 2
+        output=$(cat "$output_file" 2>/dev/null)
+        if [[ "$output" == *"LOCK_ACQUIRED"* ]]; then
+            rm -f "$output_file"
+            log "  锁已获取 (PID=${LOCK_PID})"
+        elif [[ "$output" == *"LOCK_TIMEOUT"* ]]; then
+            rm -f "$output_file"
+            log "  ✗ 获取锁超时，可能有其他实例正在运行"
+            end_run "fail"
+            exit 1
+        elif ! kill -0 "$LOCK_PID" 2>/dev/null; then
+            rm -f "$output_file"
+            log "  ✗ 锁进程意外退出"
+            end_run "fail"
+            exit 1
+        else
+            rm -f "$output_file"
+            log "  ✗ 无法确认锁状态，可能存在竞争"
+            end_run "fail"
+            exit 1
+        fi
+    fi
 }
 
 # 锁释放函数（带 guard、进程检查和文件清理）

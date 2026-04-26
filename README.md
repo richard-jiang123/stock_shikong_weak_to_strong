@@ -1113,6 +1113,40 @@ shikong_fufei/
 └── README.md
 ```
 
+## 更新日志
+
+### 2026-04-26: 系统问题修复 (v3.1)
+
+基于设计文档 `docs/superpowers/plans/2026-04-26-system-fix-plan.md` 完成以下修复：
+
+| 问题ID | 修复内容 | 文件 |
+|--------|----------|------|
+| P0-1 | 进程锁重构：CLI sleep loop 模式，解决 stdin.read() TOCTOU 问题 | process_lock.py, daily_run.sh |
+| P0-2 | 每周优化绕过沙盒：删除 cfg.set() 直接调用，走沙盒流程 | weekly_optimizer.py |
+| P0-3 | 信号层直接写库：删除 UPDATE signal_status，走沙盒流程 | weekly_optimizer.py |
+| P0-4 | critical 预警路径：新增 emergency_apply_changes 紧急应用方法 | sandbox_validator.py, adaptive_engine.py |
+| P1-4 | 目标函数硬截断：smooth_objective 改用二次惩罚 + 下界 -0.5 | strategy_optimizer.py |
+| P1-5 | 失败通知机制：handle_error + trap ERR + release_lock guard | daily_run.sh |
+| P1-6 | 评分权重梯度消失：adjust_score_weight 添加动量机制 | weekly_optimizer.py |
+| P2-7 | Walk-Forward 应用：新增 --auto-apply CLI，调用 emergency_apply | strategy_optimizer.py |
+| P2-8 | 坐标下降轮数：OPT_ROUNDS 从 3 增加到 10 | daily_run.sh |
+| P2-9 | 采样偏差：get_dynamic_seed 使用日期+时间+PID 动态种子 | strategy_optimizer.py |
+
+**关键改进：**
+
+- 进程锁：修复并发启动时的锁竞争问题，通过检查子进程输出 `LOCK_ACQUIRED` 确认锁真正获取
+- 沙盒机制：所有参数变更都通过 `sandbox_config` 暂存，由 `apply_passed_changes` 统一应用
+- 紧急应用：`emergency_apply_changes` 用于 critical 预警场景，绕过 3 周验证窗口
+- 目标函数：负期望值二次惩罚，优化方向更明确
+
+### 2026-04-25: ChangeManager 实现
+
+- 新增 `change_manager.py`：参数变更生命周期管理
+- 快照管理：变更前状态保存到 `param_snapshot`
+- 参数隔离：变更暂存到 `sandbox_config`，不直接写入生产参数
+- 批量回滚：`rollback_batch()` 支持按批次回滚
+- 主动监控：`monitor_and_rollback()` 自动检测需要回滚的批次（30天窗口）
+
 ## 免责声明
 
 本系统仅用于量化策略学习和研究，不构成任何投资建议。股市有风险，交易需谨慎。

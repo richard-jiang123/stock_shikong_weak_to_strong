@@ -296,8 +296,8 @@ class AdaptiveEngine:
 
         流程：生成批次ID -> 保存快照 -> 暂存变更 -> 紧急应用
         """
-        # 1. 生成紧急批次 ID
-        date_str = monitor_date.replace('-', '')
+        # 1. 生成紧急批次 ID（带 -crit 后缀）
+        date_str = monitor_date.replace('-', '') + '-crit'
         batch_id = self.change_mgr.generate_batch_id(date_str)
 
         # 2. 保存快照（变更前状态）
