@@ -60,9 +60,26 @@ class AdaptiveEngine:
         if monitor_date is None:
             monitor_date = actual_run_date
 
-        # 获取最近交易日（用于判断是否已处理 critical）
-        # 非交易日多次运行共用同一个判断基准
+        # 获取最近交易日
         latest_trade_date = self._get_latest_trade_date()
+
+        # 判断 monitor_date 是否为交易日
+        is_monitor_date_trading = self._is_trading_day(monitor_date)
+
+        # 非交易日运行监控的决策
+        if not is_monitor_date_trading:
+            # 非交易日：只执行回滚监控（基于配置参数），跳过数据监控
+            rollback_result = self.change_mgr.monitor_and_rollback()
+            if rollback_result['rollback_triggered'] > 0:
+                self._notify_rollback_result(rollback_result)
+            return {
+                'alerts': [],
+                'critical_handled': 0,
+                'status': 'skipped',
+                'reason': 'non_trading_day',
+                'message': f'{monitor_date} 是非交易日（周末/节假日），跳过数据监控',
+                'rollback_monitor': rollback_result,
+            }
 
         # 判断是否是"当前监控"（数据日期 >= 最近交易日）
         # 历史数据回补不应触发参数变更
@@ -459,20 +476,53 @@ class AdaptiveEngine:
 
     def _get_latest_trade_date(self):
         """
-        获取最近交易日（从 stock_daily 表查询最新数据日期）
+        获取最近交易日（考虑节假日）
 
-        用于判断 critical 处理是否已执行：
-        - 非交易日多次运行共用同一个判断基准
-        - 新交易日开始后才允许再次触发 critical 处理
+        优先从 stock_daily 获取最新数据日期（隐式排除节假日）
+        如果数据库为空，尝试从 trading_day_cache 获取最近的交易日
+        最后回退到今天（需调用方自行判断是否为交易日）
+
+        Returns:
+            str: 最近交易日日期 (YYYY-MM-DD)
         """
+        # 方法1: 从实际数据获取（最可靠）
         with self.dl._get_conn() as conn:
             row = conn.execute("""
                 SELECT MAX(date) FROM stock_daily
             """).fetchone()
             if row and row[0]:
                 return row[0]
-            # 无数据时返回今天
-            return datetime.now().strftime('%Y-%m-%d')
+
+            # 方法2: 从交易日缓存获取最近交易日
+            row = conn.execute("""
+                SELECT date FROM trading_day_cache
+                WHERE is_trading_day = 1
+                ORDER BY date DESC LIMIT 1
+            """).fetchone()
+            if row and row[0]:
+                return row[0]
+
+        # 方法3: 回退到今天（调用方需判断是否为交易日）
+        return datetime.now().strftime('%Y-%m-%d')
+
+    def _is_trading_day(self, date_str):
+        """
+        判断是否为交易日（考虑节假日）
+
+        Returns:
+            bool: True=交易日, False=非交易日(周末/节假日)
+        """
+        # 先检查缓存
+        with self.dl._get_conn() as conn:
+            row = conn.execute("""
+                SELECT is_trading_day FROM trading_day_cache WHERE date=?
+            """, (date_str,)).fetchone()
+            if row is not None:
+                return row[0] == 1
+
+        # 无缓存时简单判断周末（节假日需要实际数据或 API）
+        dt = datetime.strptime(date_str, '%Y-%m-%d')
+        return dt.weekday() < 5  # 周一至周五
 
     def _check_optimization_already_run(self, optimize_date):
         """检查今天是否已经执行过每周优化（已完成验证的记录）"""
