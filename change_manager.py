@@ -1201,3 +1201,256 @@ class ChangeManager:
             """, (monitor_date, alert_detail))
 
             return conn.execute("SELECT changes()").fetchone()[0] > 0
+
+    # ─────────────────────────────────────────────
+    # 辅助方法
+    # ─────────────────────────────────────────────
+
+    def generate_batch_id(self, date_str: str = None) -> str:
+        """
+        生成批次ID
+        格式: YYYYMMDD-{seq}
+        Args:
+            date_str: 日期字符串，默认今天
+        Returns:
+            batch_id
+        """
+        if date_str is None:
+            date_str = datetime.now().strftime('%Y%m%d')
+
+        with self.dl._get_conn() as conn:
+            count = conn.execute("""
+                SELECT COUNT(DISTINCT batch_id) FROM sandbox_config
+                WHERE batch_id LIKE ?
+            """, (f"{date_str}-%",)).fetchone()[0]
+
+        seq = count + 1
+        return f"{date_str}-{seq:03d}"
+
+    def get_status_summary(self) -> Dict:
+        """获取变更管理状态摘要"""
+        with self.dl._get_conn() as conn:
+            staged_count = conn.execute(
+                "SELECT COUNT(*) FROM sandbox_config WHERE status='staged'"
+            ).fetchone()[0]
+
+            validating_count = conn.execute(
+                "SELECT COUNT(*) FROM sandbox_config WHERE status='validating'"
+            ).fetchone()[0]
+
+            passed_count = conn.execute(
+                "SELECT COUNT(*) FROM sandbox_config WHERE status='passed'"
+            ).fetchone()[0]
+
+            applied_count = conn.execute(
+                "SELECT COUNT(*) FROM sandbox_config WHERE status='applied'"
+            ).fetchone()[0]
+
+            rollback_count = conn.execute(
+                "SELECT COUNT(*) FROM sandbox_config WHERE rollback_triggered=1"
+            ).fetchone()[0]
+
+            latest_snapshot = conn.execute("""
+                SELECT id, snapshot_date, batch_id FROM param_snapshot
+                ORDER BY id DESC LIMIT 1
+            """).fetchone()
+
+        return {
+            'staged': staged_count,
+            'validating': validating_count,
+            'passed': passed_count,
+            'applied': applied_count,
+            'rolled_back': rollback_count,
+            'latest_snapshot': {
+                'id': latest_snapshot[0],
+                'date': latest_snapshot[1],
+                'batch_id': latest_snapshot[2],
+            } if latest_snapshot else None,
+        }
+
+    def print_status_summary(self):
+        """打印状态摘要"""
+        summary = self.get_status_summary()
+
+        print(f"\n{'='*50}")
+        print("[变更管理状态]")
+        print(f"{'='*50}")
+
+        print(f"\n[待处理]")
+        print(f"  暂存: {summary['staged']} 项")
+        print(f"  验证中: {summary['validating']} 项")
+        print(f"  已通过待应用: {summary['passed']} 项")
+
+        print(f"\n[已处理]")
+        print(f"  已应用: {summary['applied']} 项")
+        print(f"  已回滚: {summary['rolled_back']} 项")
+
+        if summary['latest_snapshot']:
+            print(f"\n[最近快照] ID={summary['latest_snapshot']['id']}")
+            print(f"  时间: {summary['latest_snapshot']['date']}")
+            print(f"  批次: {summary['latest_snapshot']['batch_id']}")
+
+        print(f"\n{'='*50}")
+
+    def get_change_history(self, param_key: str = None, days: int = 90) -> List[Dict]:
+        """查询变更历史"""
+        cutoff_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        with self.dl._get_conn() as conn:
+            if param_key:
+                rows = conn.execute("""
+                    SELECT id, batch_id, param_key, sandbox_value, current_value,
+                           optimize_type, status, applied_at, rollback_triggered, rollback_reason
+                    FROM sandbox_config
+                    WHERE param_key=? AND staged_at >= ?
+                    ORDER BY staged_at DESC
+                """, (param_key, cutoff_date)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT id, batch_id, param_key, sandbox_value, current_value,
+                           optimize_type, status, applied_at, rollback_triggered, rollback_reason
+                    FROM sandbox_config
+                    WHERE staged_at >= ?
+                    ORDER BY staged_at DESC
+                """, (cutoff_date,)).fetchall()
+
+        return [
+            {
+                'id': r[0],
+                'batch_id': r[1],
+                'param_key': r[2],
+                'sandbox_value': r[3],
+                'current_value': r[4],
+                'optimize_type': r[5],
+                'status': r[6],
+                'applied_at': r[7],
+                'rollback_triggered': r[8],
+                'rollback_reason': r[9],
+            }
+            for r in rows
+        ]
+
+    def get_batch_trace(self, batch_id: str) -> Dict:
+        """追溯批次变更完整路径"""
+        batch_info = self.get_batch_info(batch_id)
+
+        if batch_info is None:
+            return {'batch_id': batch_id, 'found': False}
+
+        sandbox_status_map = self._get_batch_sandbox_status_map(batch_id)
+
+        with self.dl._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT id, optimize_date, optimize_type, param_key, old_value, new_value,
+                       trigger_reason, rollback_triggered, rollback_reason
+                FROM optimization_history
+                WHERE batch_id=?
+                ORDER BY id
+            """, (batch_id,)).fetchall()
+
+        opt_history = [
+            {
+                'id': r[0],
+                'optimize_date': r[1],
+                'optimize_type': r[2],
+                'param_key': r[3],
+                'old_value': r[4],
+                'new_value': r[5],
+                'trigger_reason': r[6],
+                'rollback_triggered': r[7],
+                'rollback_reason': r[8],
+                'sandbox_status': sandbox_status_map.get(r[3], 'unknown'),
+            }
+            for r in rows
+        ]
+
+        return {
+            'batch_id': batch_id,
+            'found': True,
+            'snapshot': batch_info['snapshot'],
+            'changes': batch_info['changes'],
+            'optimization_history': opt_history,
+            'total_changes': batch_info['total_changes'],
+            'applied_count': batch_info['applied_count'],
+            'rollback_count': batch_info['rollback_count'],
+            'is_rolled_back': batch_info['is_rolled_back'],
+        }
+
+    def _get_batch_sandbox_status_map(self, batch_id: str) -> Dict[str, str]:
+        """一次性获取批次所有参数的 sandbox 状态"""
+        with self.dl._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT param_key, status FROM sandbox_config WHERE batch_id=?
+            """, (batch_id,)).fetchall()
+
+        return {r[0]: r[1] for r in rows}
+
+    def print_batch_trace(self, batch_id: str):
+        """打印批次追溯信息"""
+        trace = self.get_batch_trace(batch_id)
+
+        if not trace.get('found'):
+            print(f"\n[追溯] 批次 {batch_id} 未找到")
+            return
+
+        print(f"\n{'='*60}")
+        print(f"[变更追溯] 批次: {batch_id}")
+        print(f"{'='*60}")
+
+        snapshot = trace.get('snapshot')
+        if snapshot:
+            print(f"\n[快照] ID={snapshot['id']} 时间={snapshot['snapshot_date']}")
+            print(f"  触发原因: {snapshot['trigger_reason']}")
+
+        changes = trace.get('changes', [])
+        print(f"\n[变更] 共 {len(changes)} 项")
+        for c in changes:
+            status = c['status']
+            rollback = '已回滚' if c['rollback_triggered'] else ''
+            print(f"  {c['param_key']}: {c['current_value']} -> {c['sandbox_value']} [{status}] {rollback}")
+
+        if trace['is_rolled_back']:
+            print(f"\n[回滚] 已触发回滚")
+            rolled_changes = [c for c in changes if c['rollback_triggered']]
+            if rolled_changes:
+                reason = rolled_changes[0].get('rollback_reason', '未知')
+                print(f"  原因: {reason}")
+
+        print(f"\n{'='*60}")
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='变更管理模块')
+    parser.add_argument('--mode', choices=['status', 'history', 'trace', 'monitor'], default='status')
+    parser.add_argument('--batch-id', default=None, help='批次ID')
+    parser.add_argument('--param-key', default=None, help='参数名')
+    parser.add_argument('--days', type=int, default=90, help='回看天数')
+    args = parser.parse_args()
+
+    mgr = ChangeManager()
+
+    if args.mode == 'status':
+        mgr.print_status_summary()
+
+    elif args.mode == 'history':
+        history = mgr.get_change_history(args.param_key, args.days)
+        print(f"\n[变更历史] 最近 {args.days} 天")
+        for item in history:
+            print(f"  {item['param_key']}: {item['current_value']} -> {item['sandbox_value']} [{item['status']}]")
+
+    elif args.mode == 'trace':
+        if args.batch_id:
+            mgr.print_batch_trace(args.batch_id)
+        else:
+            print("请指定 --batch-id")
+
+    elif args.mode == 'monitor':
+        result = mgr.monitor_and_rollback()
+        print(f"\n[主动回滚监控]")
+        print(f"  检查: {result['checked']} 批次")
+        print(f"  触发回滚: {result['rollback_triggered']} 批次")
+        if result['details']:
+            for d in result['details']:
+                if d['degradation'].get('should_rollback'):
+                    print(f"  [回滚] {d['batch_id']}: {d['degradation']['reason']}")

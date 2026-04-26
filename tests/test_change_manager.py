@@ -1204,6 +1204,77 @@ class TestChangeManager(unittest.TestCase):
             self.assertEqual(row[0], 'rejected')
             self.assertEqual(row[1], 1)
 
+    # ─────────────────────────────────────────────
+    # 辅助方法测试
+    # ─────────────────────────────────────────────
+
+    def test_generate_batch_id(self):
+        """测试批次ID生成"""
+        # 第一次生成，无已存在批次，应返回 001
+        batch_id1 = self.mgr.generate_batch_id('20260426')
+        self.assertEqual(batch_id1, '20260426-001')
+
+        # 创建一条记录使用该批次ID
+        self.mgr.stage_change('strategy_config', 'first_wave_min_days', 5, batch_id1)
+
+        # 第二次生成，已有1个批次，应返回 002
+        batch_id2 = self.mgr.generate_batch_id('20260426')
+        self.assertEqual(batch_id2, '20260426-002')
+
+    def test_get_change_history(self):
+        """测试变更历史查询"""
+        self.mgr.stage_change('strategy_config', 'first_wave_min_days', 0.18, '20260426-001')
+        self.mgr.stage_change('strategy_config', 'stop_loss_buffer', 0.03, '20260426-001')
+        self.mgr.stage_change('strategy_config', 'first_wave_min_days', 0.20, '20260426-002')
+
+        history = self.mgr.get_change_history('first_wave_min_days', days=30)
+
+        self.assertEqual(len(history), 2)
+
+    def test_get_status_summary(self):
+        """测试状态摘要"""
+        self.mgr.stage_change('strategy_config', 'first_wave_min_days', 1.0, 'test-001')
+        self.mgr.stage_change('strategy_config', 'stop_loss_buffer', 2.0, 'test-002')
+
+        summary = self.mgr.get_status_summary()
+
+        self.assertEqual(summary['staged'], 2)
+        self.assertEqual(summary['applied'], 0)
+        self.assertEqual(summary['rolled_back'], 0)
+
+    def test_get_batch_trace(self):
+        """测试批次追溯"""
+        self.mgr.stage_change('strategy_config', 'first_wave_min_days', 0.18, '20260426-001')
+        self.mgr.stage_change('strategy_config', 'stop_loss_buffer', 0.03, '20260426-001')
+
+        trace = self.mgr.get_batch_trace('20260426-001')
+
+        self.assertEqual(trace['found'], True)
+        self.assertEqual(trace['batch_id'], '20260426-001')
+        self.assertEqual(len(trace['changes']), 2)
+        self.assertEqual(trace['total_changes'], 2)
+
+    def test_get_batch_sandbox_status_map(self):
+        """测试N+1查询修复：_get_batch_sandbox_status_map"""
+        self.mgr.stage_change('strategy_config', 'first_wave_min_days', 1.0, 'test-batch-001')
+        self.mgr.stage_change('strategy_config', 'stop_loss_buffer', 2.0, 'test-batch-001')
+        self.mgr.stage_change('strategy_config', 'max_hold_days', 3.0, 'test-batch-001')
+
+        status_map = self.mgr._get_batch_sandbox_status_map('test-batch-001')
+
+        # 验证返回字典格式正确
+        self.assertIsInstance(status_map, dict)
+        self.assertEqual(len(status_map), 3)
+        self.assertEqual(status_map['first_wave_min_days'], 'staged')
+        self.assertEqual(status_map['stop_loss_buffer'], 'staged')
+        self.assertEqual(status_map['max_hold_days'], 'staged')
+
+    def test_get_batch_trace_not_found(self):
+        """测试批次不存在时的追溯"""
+        trace = self.mgr.get_batch_trace('nonexistent-batch')
+
+        self.assertEqual(trace['found'], False)
+
 
 if __name__ == '__main__':
     unittest.main()
