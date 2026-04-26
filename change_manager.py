@@ -7,6 +7,7 @@
 import os
 import sys
 import json
+import sqlite3
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
@@ -383,7 +384,7 @@ class ChangeManager:
                     VALUES (?, ?, ?, ?, ?, 'staged')
                 """, (batch_id, param_key, sandbox_value_str, current_value_str, optimize_type))
                 sandbox_id = cursor.lastrowid
-            except Exception:
+            except sqlite3.IntegrityError:
                 # 已存在，更新
                 conn.execute("""
                     UPDATE sandbox_config
@@ -543,39 +544,59 @@ class ChangeManager:
         Returns:
             bool: 是否提交成功
         """
-        # 1. 读取沙盒记录
+        # 使用单一事务确保原子性
         with self.dl._get_conn() as conn:
+            # 1. 读取沙盒记录（包含状态）
             row = conn.execute("""
-                SELECT param_key, sandbox_value, current_value, optimize_type
+                SELECT param_key, sandbox_value, current_value, optimize_type, status
                 FROM sandbox_config WHERE id = ?
             """, (sandbox_id,)).fetchone()
 
-        if row is None:
-            return False
+            if row is None:
+                return False
 
-        param_key, sandbox_value_str, current_value_str, optimize_type = row
+            param_key, sandbox_value_str, current_value_str, optimize_type, status = row
 
-        # 2. 根据 optimize_type 转换值并写入
-        if optimize_type == 'signal_status':
-            # signal_status: 写入 signal_status 表
-            new_status = sandbox_value_str
-            weight_multiplier = get_weight_multiplier(new_status)
-            with self.dl._get_conn() as conn:
+            # 2. 验证状态：只允许从 passed 或 staged 状态提交
+            if status not in ('passed', 'staged'):
+                return False
+
+            # 3. 根据 optimize_type 转换值并写入（在同一事务内）
+            if optimize_type == 'signal_status':
+                # signal_status: 写入 signal_status 表
+                new_status = sandbox_value_str
+                weight_multiplier = get_weight_multiplier(new_status)
                 conn.execute("""
                     UPDATE signal_status
                     SET status_level = ?, weight_multiplier = ?, last_check_date = datetime('now')
                     WHERE signal_type = ?
                 """, (new_status, weight_multiplier, param_key))
-        else:
-            # strategy_config: 转换为数值并写入
-            try:
-                new_value = float(sandbox_value_str)
-            except (ValueError, TypeError):
-                new_value = sandbox_value_str
-            self.cfg.set(param_key, new_value)
+            else:
+                # strategy_config: 转换为数值并写入
+                try:
+                    new_value = float(sandbox_value_str)
+                except (ValueError, TypeError):
+                    new_value = sandbox_value_str
 
-        # 3. 更新沙盒状态为 applied
-        return self.update_status(sandbox_id, 'applied')
+                # 直接写入 strategy_config 表
+                conn.execute("""
+                    INSERT OR REPLACE INTO strategy_config
+                    (param_key, param_value, description, category, updated_at)
+                    VALUES (?, ?,
+                            COALESCE((SELECT description FROM strategy_config WHERE param_key=?), ''),
+                            COALESCE((SELECT category FROM strategy_config WHERE param_key=?), 'unknown'),
+                            ?)
+                """, (param_key, str(new_value), param_key, param_key,
+                      datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+            # 4. 更新沙盒状态为 applied（在同一事务内）
+            conn.execute("""
+                UPDATE sandbox_config
+                SET status = 'applied', applied_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (sandbox_id,))
+
+            return conn.execute("SELECT changes()").fetchone()[0] > 0
 
     def reject_change(self, sandbox_id: int, reason: str) -> bool:
         """

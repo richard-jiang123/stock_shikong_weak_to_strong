@@ -473,6 +473,40 @@ class TestChangeManager(unittest.TestCase):
         self.assertEqual(len(params), 1)
         self.assertEqual(params[0]['sandbox_value'], 7.0)
 
+    def test_commit_change_nonexistent_id(self):
+        """测试：提交不存在的 sandbox_id 返回 False"""
+        result = self.mgr.commit_change(99999)
+        self.assertFalse(result)
+
+    def test_commit_change_invalid_status(self):
+        """测试：提交 rejected 状态的变更返回 False"""
+        batch_id = 'batch_invalid_status_001'
+
+        # 暂存变更
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=10,
+            batch_id=batch_id
+        )
+
+        # 拒绝变更
+        self.mgr.reject_change(sandbox_id, reason='test_reject')
+
+        # 验证状态为 rejected
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT status FROM sandbox_config WHERE id = ?
+            """, (sandbox_id,)).fetchone()
+            self.assertEqual(row[0], 'rejected')
+
+        # 尝试提交应该失败
+        result = self.mgr.commit_change(sandbox_id)
+        self.assertFalse(result)
+
+        # 验证配置未变
+        self.assertEqual(self.cfg.get('first_wave_min_days'), 3)
+
 
 if __name__ == '__main__':
     unittest.main()
