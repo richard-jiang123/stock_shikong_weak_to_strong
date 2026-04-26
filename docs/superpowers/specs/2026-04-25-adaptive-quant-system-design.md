@@ -319,13 +319,22 @@ def get_sample_adjusted_threshold(sample_count, base_expectancy):
             reason = desc
             break
     
-    required_expectancy = base_expectancy * multiplier
+    # 边界情况处理：当基准期望值 <= 0 时，乘数放大无意义（负值乘数反而更宽松）
+    # 此时应使用固定正阈值作为验证线，而非乘数关系
+    if base_expectancy <= 0:
+        # 基准为负或零 → 新参数至少要达到正阈值才算改进
+        required_expectancy = 0.005  # 固定阈值：0.5%（至少要有正向收益）
+        reason = f'{reason}，基准<=0时使用固定阈值'
+        multiplier = None  # 乘数逻辑不适用
+    else:
+        required_expectancy = base_expectancy * multiplier
     
     return {
         'required_expectancy': required_expectancy,
         'multiplier': multiplier,
         'reason': reason,
         'tier': threshold_samples if sample_count >= 10 else 0,
+        'base_expectancy': base_expectancy,
     }
 
 
@@ -558,10 +567,11 @@ def adjust_score_weight(current_weight, correlation, base_weight=1.0):
     new_weight = current_weight * (1 + delta)
     new_weight = max(0.7, min(1.5, new_weight))  # 下限-30%，上限+50%
     
-    # 回归锚点：长期运行后权重应回归至基准附近（防止持续单向漂移）
-    # 每次调整后，向基准值微幅回归（回归系数0.05）
-    regression_factor = 0.05
-    new_weight = new_weight * (1 - regression_factor) + base_weight * regression_factor
+    # 回归锚点：仅在有权重调整时回归，防止持续单向漂移
+    # 注意：delta=0时不回归，避免无调整时权重自然衰减
+    if delta != 0:
+        regression_factor = 0.05  # 回归系数：每次调整后向基准微幅回归5%
+        new_weight = new_weight * (1 - regression_factor) + base_weight * regression_factor
 
     return new_weight
 
@@ -946,7 +956,7 @@ def get_market_regime_smoothed(index_data, lookback=20, new_value_weight=0.3):
     
     Args:
         index_data: 指数K线数据
-        lookback: 回看窗口
+        lookback: 回看窗口（保留参数，暂未使用，未来可用于更长周期的MA计算）
         new_value_weight: 新值权重（默认0.3，即新值占30%，旧值占70%）
                           值越小越保守，值越大越敏感
     
@@ -1905,3 +1915,13 @@ def _cache_trading_day(self, date, is_trading_day, data_available):
 | min_samples_per_week定义但未使用 | 中等 | 在验证逻辑中新增样本数约束检查 | B.6 |
 | 滚动窗口循环无意义（week变量未使用） | 严重 | 重构为累计验证模式，每次调用只算当前周 | B.6 |
 | 信号降级与沙盒验证阈值易混淆 | 轻微 | 新增对比表格，明确适用场景区别 | 正文195-215行后 |
+
+---
+
+### B.18 修订汇总（第八轮）
+
+| 评审问题 | 解决方案 | 章节 |
+|----------|----------|------|
+| get_market_regime_smoothed的lookback参数未使用 | 标注为"保留参数，暂未使用" | B.5 |
+| adjust_score_weight回归逻辑始终生效(delta=0时也回归) | 新增条件判断，仅delta≠0时回归 | 正文560-565行 |
+| get_sample_adjusted_threshold零/负基准边界处理 | 新增边界逻辑：base<=0时使用固定阈值0.5% | 正文322行 |
