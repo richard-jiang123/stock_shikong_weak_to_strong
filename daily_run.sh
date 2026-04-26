@@ -480,6 +480,43 @@ run_adaptive_status() {
     log "────────────── 状态查询完成 ───────────────"
 }
 
+run_change_status() {
+    log "─────────────── 变更管理状态 ───────────────"
+    $PY change_manager.py --mode status 2>&1 | while IFS= read -r line; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
+    done
+    log "────────────── 状态查询完成 ───────────────"
+}
+
+run_change_history() {
+    log "─────────────── 变更历史 ───────────────"
+    $PY change_manager.py --mode history --days $LOOKBACK 2>&1 | while IFS= read -r line; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
+    done
+    log "────────────── 历史查询完成 ───────────────"
+}
+
+run_batch_trace() {
+    local batch_id="$1"
+    log "─────────────── 批次追溯 ───────────────"
+    $PY change_manager.py --mode trace --batch-id "$batch_id" 2>&1 | while IFS= read -r line; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
+    done
+    log "────────────── 追溯完成 ───────────────"
+}
+
+run_rollback_monitor() {
+    log "─────────────── 主动回滚监控 ───────────────"
+    $PY change_manager.py --mode monitor 2>&1 | while IFS= read -r line; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
+    done
+    log "────────────── 监控完成 ───────────────"
+}
+
 # ── Main ──
 start_run
 
@@ -499,6 +536,10 @@ case "$CMD" in
     --weekly-optimize) run_weekly_optimize; end_run "ok" ;;
     --adaptive)   run_monitor && run_weekly_optimize && run_adaptive_status; end_run "ok" ;;
     --status)     run_adaptive_status; end_run "ok" ;;
+    --change-status)   run_change_status; end_run "ok" ;;
+    --change-history)  run_change_history; end_run "ok" ;;
+    --batch-trace)     run_batch_trace "$2"; end_run "ok" ;;
+    --rollback-monitor) run_rollback_monitor; end_run "ok" ;;
     all|"")
         run_scan
         echo "" >> "$LOGFILE"
