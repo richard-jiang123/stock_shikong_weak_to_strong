@@ -13,15 +13,17 @@ from data_layer import get_data_layer, StockDataLayer
 from strategy_config import StrategyConfig
 from strategy_optimizer import StrategyOptimizer
 from signal_constants import SIGNAL_TYPE_MAPPING, get_weight_multiplier
+from normalizer import ScoreNormalizer, SCORE_DIMENSIONS
 
 
-def adjust_score_weight(current_weight, correlation):
+def adjust_score_weight(current_weight, correlation, base_weight=1.0):
     """
     根据评分-盈亏相关性动态调整权重
 
     Args:
         current_weight: 当前权重值
         correlation: Spearman相关系数（score vs final_pnl）
+        base_weight: 基准权重（默认1.0），用于回归锚点
 
     Returns:
         新权重值（调整幅度限制在 ±20%）
@@ -32,14 +34,21 @@ def adjust_score_weight(current_weight, correlation):
     if correlation > 0.3:
         # 强正相关 → 加权（最多增加20%）
         adjustment = min(MAX_ADJUSTMENT, correlation * 0.5)
-        return current_weight * (1 + adjustment)
+        new_weight = current_weight * (1 + adjustment)
     elif correlation < -0.2:
         # 负相关 → 减权（最多减少20%）
         adjustment = min(MAX_ADJUSTMENT, abs(correlation) * 0.5)
-        return current_weight * (1 - adjustment)
+        new_weight = current_weight * (1 - adjustment)
     else:
-        # 弱相关 → 保持不变
-        return current_weight
+        # 弱相关 → 回归锚点（向 base_weight 靠拢）
+        delta = current_weight - base_weight
+        if abs(delta) > 0.01:
+            # 每次回归 10% 的偏差
+            new_weight = current_weight - delta * 0.1
+        else:
+            new_weight = current_weight
+
+    return new_weight
 
 
 class WeeklyOptimizer:
@@ -194,22 +203,40 @@ class WeeklyOptimizer:
                 'adjusted': bool,
                 'weight_changes': dict,
                 'correlations': dict,
+                'history_meta': dict,
             }
         """
-        # 获取各评分项与盈亏的相关性
+        # 1. 检查历史统计置信度
+        normalizer = ScoreNormalizer(data_layer=self.dl)  # 复用已有数据层实例
+        history_stats, meta = normalizer.get_history_stats()
+
+        if meta['confidence'] == 'low':
+            return {
+                'adjusted': False,
+                'reason': f'样本不足({meta["n"]}笔)，暂不调整权重',
+                'history_meta': meta,
+            }
+
+        # 2. 获取各评分项与盈亏的相关性
         correlations = self._compute_score_correlations()
 
         if correlations is None:
-            return {'adjusted': False, 'reason': 'insufficient_data'}
+            return {'adjusted': False, 'reason': 'insufficient_correlation_data', 'history_meta': meta}
 
-        # 获取当前权重
+        # 3. 获取当前权重
         current_weights = self.cfg.get_weights()
 
-        # 调整权重
+        # 4. 权重键名到相关性键名的映射
+        # 注意：weight_strong_gain 对应 score_day_gain（数据库字段名）
+        WEIGHT_TO_SCORE = {
+            'weight_strong_gain': 'score_day_gain',  # 特殊映射
+        }
+
+        # 5. 调整权重
         weight_changes = {}
         for weight_key in current_weights:
             # 找对应的相关性指标
-            score_key = weight_key.replace('weight_', 'score_')
+            score_key = WEIGHT_TO_SCORE.get(weight_key, weight_key.replace('weight_', 'score_'))
             if score_key in correlations:
                 correlation = correlations[score_key]
                 old_weight = current_weights[weight_key]
@@ -222,10 +249,38 @@ class WeeklyOptimizer:
                         'correlation': correlation,
                     }
 
+        # 6. 验证归一化效果（如果有调整）
+        if weight_changes:
+            # 模拟一只"平均股票"，验证归一化后总分是否稳定
+            avg_scores = {dim: history_stats.get(f'avg_{dim}', 10) for dim in SCORE_DIMENSIONS}
+
+            # 更新权重
+            updated_weights = current_weights.copy()
+            for k, v in weight_changes.items():
+                updated_weights[k] = v['new']
+
+            normalized_avg, verify_meta = normalizer.normalize_scores(avg_scores, updated_weights)
+
+            expected_avg = sum(history_stats.get(f'avg_{dim}', 10) for dim in SCORE_DIMENSIONS)
+            deviation = abs(normalized_avg - expected_avg)
+
+            if deviation > 5:  # 允许5分偏差
+                return {
+                    'adjusted': False,
+                    'reason': f'归一化验证失败：偏差{deviation:.1f}分',
+                    'weight_changes': weight_changes,
+                    'history_meta': meta,
+                }
+
+            # 应用权重变更
+            for weight_key, change in weight_changes.items():
+                self.cfg.set(weight_key, change['new'])
+
         return {
             'adjusted': len(weight_changes) > 0,
             'weight_changes': weight_changes,
             'correlations': correlations,
+            'history_meta': meta,
         }
 
     def _compute_score_correlations(self):
