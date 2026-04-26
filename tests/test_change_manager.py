@@ -5,6 +5,7 @@ import sys
 import os
 import tempfile
 import sqlite3
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -33,6 +34,9 @@ class TestChangeManager(unittest.TestCase):
         # 初始化 signal_status 表（添加测试数据）
         self._init_signal_status()
 
+        # 初始化 pick_tracking 表（用于回滚监控测试）
+        self._init_pick_tracking()
+
         # 创建 ChangeManager 实例
         self.mgr = ChangeManager(self.db_path)
 
@@ -59,6 +63,51 @@ class TestChangeManager(unittest.TestCase):
                     (signal_type, display_name, status_level, weight_multiplier)
                     VALUES (?, ?, ?, ?)
                 """, signal)
+
+    def _init_pick_tracking(self):
+        """初始化 pick_tracking 表（回滚监控测试需要）"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pick_tracking (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pick_date TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    score REAL,
+                    wave_gain REAL,
+                    cons_dd REAL,
+                    vol_ratio REAL,
+                    entry_price REAL,
+                    stop_loss REAL,
+                    cons_low REAL,
+                    market_regime TEXT,
+                    index_code TEXT,
+                    name TEXT,
+                    status TEXT DEFAULT 'active',
+                    exit_date TEXT,
+                    exit_price REAL,
+                    exit_reason TEXT,
+                    hold_days INTEGER,
+                    max_price REAL,
+                    min_price REAL,
+                    final_pnl_pct REAL,
+                    max_pnl_pct REAL,
+                    max_dd_pct REAL,
+                    score_wave_gain REAL,
+                    score_shallow_dd REAL,
+                    score_day_gain REAL,
+                    score_volume REAL,
+                    score_ma_bull REAL,
+                    score_sector REAL,
+                    score_signal_bonus REAL,
+                    score_base REAL DEFAULT 5,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(pick_date, code)
+                )
+            """)
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_pick_date ON pick_tracking(pick_date)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_pick_status ON pick_tracking(status)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_pick_exit_date ON pick_tracking(exit_date)')
 
     def test_save_snapshot(self):
         """测试：保存快照并验证可以检索"""
@@ -770,6 +819,133 @@ class TestChangeManager(unittest.TestCase):
         """测试：获取不存在批次的信息返回 None"""
         info = self.mgr.get_batch_info('nonexistent_batch')
         self.assertIsNone(info)
+
+    # ─────────────────────────────────────────────
+    # 主动回滚监控测试（Layer A）
+    # ─────────────────────────────────────────────
+
+    def test_monitor_and_rollback_empty(self):
+        """测试：没有批次需要监控"""
+        result = self.mgr.monitor_and_rollback()
+
+        self.assertEqual(result['checked'], 0)
+        self.assertEqual(result['rollback_triggered'], 0)
+        self.assertEqual(len(result['details']), 0)
+
+    def test_get_applied_batches_in_monitor_window(self):
+        """测试：获取监控窗口内的已应用批次"""
+        batch_id = 'batch_monitor_001'
+
+        # 保存快照
+        self.mgr.save_snapshot('weekly_optimize', batch_id, 'pre_change')
+
+        # 暂存并提交变更
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=5,
+            batch_id=batch_id
+        )
+        self.mgr.commit_change(sandbox_id)
+
+        # 获取监控窗口内的批次
+        batches = self.mgr.get_applied_batches_in_monitor_window()
+
+        # 验证结果
+        self.assertGreaterEqual(len(batches), 1)
+        batch_ids = [b['batch_id'] for b in batches]
+        self.assertIn(batch_id, batch_ids)
+
+        # 验证批次信息字段
+        target_batch = next(b for b in batches if b['batch_id'] == batch_id)
+        self.assertIn('applied_at', target_batch)
+        self.assertIn('monitor_days_elapsed', target_batch)
+
+    def test_check_performance_degradation_sample_insufficient(self):
+        """测试：样本数不足时不触发回滚"""
+        batch_id = 'batch_degradation_001'
+
+        # 保存快照
+        self.mgr.save_snapshot('weekly_optimize', batch_id, 'pre_change')
+
+        # 暂存并提交变更
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=5,
+            batch_id=batch_id
+        )
+        self.mgr.commit_change(sandbox_id)
+
+        # 获取批次信息
+        batches = self.mgr.get_applied_batches_in_monitor_window()
+        target_batch = next(b for b in batches if b['batch_id'] == batch_id)
+
+        # 检查性能退化（没有 pick_tracking 数据，样本数不足）
+        degradation = self.mgr.check_performance_degradation(target_batch)
+
+        # 样本数不足，不应触发回滚
+        self.assertFalse(degradation['should_rollback'])
+        self.assertEqual(degradation['reason'], 'sample_insufficient')
+
+    def test_calc_metrics_in_range(self):
+        """测试：计算时间范围内的指标"""
+        # 使用当前日期附近的日期进行测试
+        today = datetime.now().strftime('%Y-%m-%d')
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        two_days_ago = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
+        three_days_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+
+        with sqlite3.connect(self.db_path) as conn:
+            # 插入已退出的交易数据，exit_date 控制在测试范围内
+            # 只插入 yesterday 和 today 的数据（共2条）
+            test_data = [
+                (three_days_ago, 'sh600001', 'anomaly_no_decline', 'exited', two_days_ago, 2.5),  # 不在范围内
+                (two_days_ago, 'sh600003', 'big_bullish_reversal', 'exited', yesterday, 3.8),     # 在范围内
+                (two_days_ago, 'sh600004', 'limit_up_open_next_strong', 'exited', today, 0.5),    # 在范围内
+            ]
+            for data in test_data:
+                conn.execute("""
+                    INSERT OR REPLACE INTO pick_tracking
+                    (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, data)
+
+        # 计算指标 - 查询 yesterday 和 today 的数据（2条）
+        metrics = self.mgr._calc_metrics_in_range(yesterday, today)
+
+        # 验证结果
+        self.assertEqual(metrics['sample_count'], 2)  # 2条数据在范围内
+        # 期望值: (3.8 + 0.5) / 2 = 2.15
+        self.assertAlmostEqual(metrics['expectancy'], 2.15, places=2)
+        # 胜率: 2盈利 / 2 = 100%
+        self.assertAlmostEqual(metrics['win_rate'], 100.0, places=1)
+
+    def test_check_consecutive_bad_trading_days_empty(self):
+        """测试：没有数据时连续负期望值天数为0"""
+        batch_id = 'batch_consecutive_001'
+
+        # 保存快照
+        self.mgr.save_snapshot('weekly_optimize', batch_id, 'pre_change')
+
+        # 暂存并提交变更
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=5,
+            batch_id=batch_id
+        )
+        self.mgr.commit_change(sandbox_id)
+
+        # 获取批次信息
+        batches = self.mgr.get_applied_batches_in_monitor_window()
+        target_batch = next(b for b in batches if b['batch_id'] == batch_id)
+
+        # 检查连续负期望值天数（没有数据）
+        consecutive_bad = self.mgr._check_consecutive_bad_trading_days(target_batch['applied_at'])
+
+        # 没有数据，应为0
+        self.assertEqual(consecutive_bad, 0)
 
 
 if __name__ == '__main__':

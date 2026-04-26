@@ -117,6 +117,21 @@ class ChangeManager:
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_opt_history_batch ON optimization_history(batch_id)")
 
+            # daily_monitor_log 表（监控日志）
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_monitor_log (
+                    id INTEGER PRIMARY KEY,
+                    monitor_date TEXT,
+                    alert_type TEXT,
+                    alert_detail TEXT,
+                    severity TEXT,
+                    action_taken TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_monitor_date ON daily_monitor_log(monitor_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_type ON daily_monitor_log(alert_type)")
+
     # ─────────────────────────────────────────────
     # 快照管理
     # ─────────────────────────────────────────────
@@ -823,3 +838,366 @@ class ChangeManager:
             'rollback_count': rollback_count,
             'is_rolled_back': is_rolled_back,
         }
+
+    # ─────────────────────────────────────────────
+    # 主动回滚监控（Layer A）
+    # ─────────────────────────────────────────────
+
+    def monitor_and_rollback(self) -> Dict:
+        """
+        检查已应用的批次并在检测到性能退化时触发回滚
+
+        Returns:
+            dict: {
+                'checked': int,       # 检查的批次数量
+                'rollback_triggered': int,  # 触发回滚的批次数量
+                'details': list       # 详细检查结果
+            }
+        """
+        # 1. 获取监控窗口内的已应用批次
+        batches = self.get_applied_batches_in_monitor_window()
+
+        if not batches:
+            return {
+                'checked': 0,
+                'rollback_triggered': 0,
+                'details': []
+            }
+
+        details = []
+        rollback_count = 0
+
+        # 2. 检查每个批次的性能退化
+        for batch in batches:
+            degradation = self.check_performance_degradation(batch)
+            details.append({
+                'batch_id': batch['batch_id'],
+                'applied_at': batch['applied_at'],
+                'should_rollback': degradation['should_rollback'],
+                'reason': degradation.get('reason', ''),
+                'expectancy_drop': degradation.get('expectancy_drop', 0),
+                'win_rate_drop': degradation.get('win_rate_drop', 0),
+            })
+
+            # 3. 如果检测到退化，触发回滚
+            if degradation['should_rollback']:
+                rollback_result = self.rollback_batch(
+                    batch['batch_id'],
+                    reason=degradation['reason']
+                )
+
+                if rollback_result['rolled_back'] > 0:
+                    rollback_count += 1
+                    # 记录回滚日志
+                    self._log_rollback(batch, degradation)
+
+        return {
+            'checked': len(batches),
+            'rollback_triggered': rollback_count,
+            'details': details
+        }
+
+    def get_applied_batches_in_monitor_window(self) -> List[Dict]:
+        """
+        获取监控窗口内（30天）的已应用批次列表
+
+        Returns:
+            List[Dict]: 批次列表，每个元素包含:
+                - batch_id: 批次ID
+                - applied_at: 应用时间
+                - monitor_days_elapsed: 已监控天数
+        """
+        cutoff_date = datetime.now() - timedelta(days=self.ROLLBACK_CONFIG['monitor_days'])
+        cutoff_str = cutoff_date.strftime('%Y-%m-%d %H:%M:%S')
+
+        with self.dl._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT batch_id, MIN(applied_at) as applied_at
+                FROM sandbox_config
+                WHERE status = 'applied'
+                  AND rollback_triggered = 0
+                  AND applied_at >= ?
+                GROUP BY batch_id
+                ORDER BY applied_at DESC
+            """, (cutoff_str,)).fetchall()
+
+        result = []
+        for row in rows:
+            batch_id, applied_at = row
+            # 计算监控天数
+            applied_dt = datetime.strptime(applied_at, '%Y-%m-%d %H:%M:%S')
+            days_elapsed = (datetime.now() - applied_dt).days
+            result.append({
+                'batch_id': batch_id,
+                'applied_at': applied_at,
+                'monitor_days_elapsed': days_elapsed
+            })
+
+        return result
+
+    def check_performance_degradation(self, batch: Dict) -> Dict:
+        """
+        检查批次是否发生性能退化
+
+        Args:
+            batch: 批次信息 dict，包含 batch_id, applied_at
+
+        Returns:
+            dict: {
+                'should_rollback': bool,
+                'reason': str,
+                'expectancy_drop': float,  # 期望值下降百分比
+                'win_rate_drop': float,    # 胜率下降值
+                'baseline': dict,          # 基线指标
+                'current': dict            # 当前指标
+            }
+        """
+        batch_id = batch['batch_id']
+        applied_at = batch['applied_at']
+
+        # 1. 获取快照作为基线
+        snapshot = self.get_latest_snapshot(batch_id=batch_id)
+        baseline = self._calc_baseline_metrics(snapshot)
+
+        # 2. 计算当前指标
+        current = self._calc_current_metrics(applied_at)
+
+        # 3. 检查样本数是否足够
+        if current['sample_count'] < self.ROLLBACK_CONFIG['min_samples_for_check']:
+            return {
+                'should_rollback': False,
+                'reason': 'sample_insufficient',
+                'expectancy_drop': 0,
+                'win_rate_drop': 0,
+                'baseline': baseline,
+                'current': current
+            }
+
+        # 4. 计算退化程度
+        expectancy_drop = 0
+        if baseline['expectancy'] > 0 and current['expectancy'] < baseline['expectancy']:
+            expectancy_drop = (baseline['expectancy'] - current['expectancy']) / baseline['expectancy']
+
+        win_rate_drop = baseline['win_rate'] - current['win_rate']
+
+        # 5. 检查是否超过阈值
+        reasons = []
+
+        # 期望值下降超过30%
+        if expectancy_drop > self.ROLLBACK_CONFIG['expectancy_drop_threshold']:
+            reasons.append(f"expectancy_drop_{expectancy_drop:.1%}")
+
+        # 胜率下降超过10个百分点
+        if win_rate_drop > self.ROLLBACK_CONFIG['win_rate_drop_threshold']:
+            reasons.append(f"win_rate_drop_{win_rate_drop:.1f}%")
+
+        # 连续5个交易日负期望值
+        consecutive_bad = self._check_consecutive_bad_trading_days(applied_at)
+        if consecutive_bad >= self.ROLLBACK_CONFIG['consecutive_bad_days']:
+            reasons.append(f"consecutive_bad_days_{consecutive_bad}")
+
+        should_rollback = len(reasons) > 0
+        reason = '; '.join(reasons) if reasons else ''
+
+        return {
+            'should_rollback': should_rollback,
+            'reason': reason,
+            'expectancy_drop': expectancy_drop,
+            'win_rate_drop': win_rate_drop,
+            'baseline': baseline,
+            'current': current
+        }
+
+    def _calc_baseline_metrics(self, snapshot: Optional[Dict]) -> Dict:
+        """
+        计算变更前的基线指标
+
+        Args:
+            snapshot: 快照信息，如果为 None 则返回默认值
+
+        Returns:
+            dict: {
+                'expectancy': float,  # 期望值（百分比形式）
+                'win_rate': float,    # 胜率（百分比）
+                'sample_count': int   # 样本数量
+            }
+        """
+        if snapshot is None:
+            # 无快照时返回默认值（百分比形式）
+            return {
+                'expectancy': 4.2,
+                'win_rate': 59.8,
+                'sample_count': 0
+            }
+
+        # 从快照创建时间往前取30天的数据作为基线
+        snapshot_date = snapshot.get('snapshot_date')
+        if snapshot_date:
+            # 解析快照日期
+            try:
+                snap_dt = datetime.strptime(snapshot_date, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                snap_dt = datetime.strptime(snapshot_date, '%Y-%m-%d')
+
+            start_date = (snap_dt - timedelta(days=30)).strftime('%Y-%m-%d')
+            end_date = snap_dt.strftime('%Y-%m-%d')
+            return self._calc_metrics_in_range(start_date, end_date)
+        else:
+            # 无日期信息，返回默认值
+            return {
+                'expectancy': 4.2,
+                'win_rate': 59.8,
+                'sample_count': 0
+            }
+
+    def _calc_current_metrics(self, applied_at: str) -> Dict:
+        """
+        计算变更后的当前指标
+
+        Args:
+            applied_at: 应用时间字符串
+
+        Returns:
+            dict: {
+                'expectancy': float,  # 期望值（百分比形式）
+                'win_rate': float,    # 胜率（百分比）
+                'sample_count': int   # 样本数量
+            }
+        """
+        try:
+            applied_dt = datetime.strptime(applied_at, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            applied_dt = datetime.strptime(applied_at, '%Y-%m-%d')
+
+        # 从应用时间到当前时间的所有数据
+        start_date = applied_dt.strftime('%Y-%m-%d')
+        end_date = datetime.now().strftime('%Y-%m-%d')
+
+        return self._calc_metrics_in_range(start_date, end_date)
+
+    def _calc_metrics_in_range(self, start_date: str, end_date: str) -> Dict:
+        """
+        计算指定时间范围内的交易指标
+
+        Args:
+            start_date: 开始日期 (YYYY-MM-DD)
+            end_date: 结束日期 (YYYY-MM-DD)
+
+        Returns:
+            dict: {
+                'expectancy': float,  # 期望值（百分比形式，如 4.2 表示 4.2%）
+                'win_rate': float,    # 胜率（百分比，如 59.8 表示 59.8%）
+                'sample_count': int   # 样本数量
+            }
+        """
+        with self.dl._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT final_pnl_pct FROM pick_tracking
+                WHERE status = 'exited'
+                  AND exit_date >= ?
+                  AND exit_date <= ?
+            """, (start_date, end_date)).fetchall()
+
+        pnl_values = [row[0] for row in rows if row[0] is not None]
+
+        if not pnl_values:
+            return {
+                'expectancy': 0.0,
+                'win_rate': 0.0,
+                'sample_count': 0
+            }
+
+        # 计算期望值（平均盈亏百分比）
+        expectancy = sum(pnl_values) / len(pnl_values)
+
+        # 计算胜率（盈利样本占比）
+        wins = sum(1 for pnl in pnl_values if pnl > 0)
+        win_rate = (wins / len(pnl_values)) * 100
+
+        return {
+            'expectancy': expectancy,
+            'win_rate': win_rate,
+            'sample_count': len(pnl_values)
+        }
+
+    def _check_consecutive_bad_trading_days(self, applied_at: str) -> int:
+        """
+        计算连续负期望值的交易日数量
+
+        Args:
+            applied_at: 应用时间字符串
+
+        Returns:
+            int: 连续负期望值的交易日天数
+        """
+        try:
+            applied_dt = datetime.strptime(applied_at, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            applied_dt = datetime.strptime(applied_at, '%Y-%m-%d')
+
+        # 从应用时间到当前时间，按交易日检查
+        start_date = applied_dt.strftime('%Y-%m-%d')
+        end_date = datetime.now().strftime('%Y-%m-%d')
+
+        with self.dl._get_conn() as conn:
+            # 获取每个交易日的期望值
+            rows = conn.execute("""
+                SELECT exit_date, final_pnl_pct FROM pick_tracking
+                WHERE status = 'exited'
+                  AND exit_date >= ?
+                  AND exit_date <= ?
+                ORDER BY exit_date DESC
+            """, (start_date, end_date)).fetchall()
+
+        if not rows:
+            return 0
+
+        # 按日期分组计算每日期望值
+        daily_pnl = {}
+        for row in rows:
+            exit_date, pnl = row
+            if exit_date and pnl is not None:
+                if exit_date not in daily_pnl:
+                    daily_pnl[exit_date] = []
+                daily_pnl[exit_date].append(pnl)
+
+        # 从最近日期开始，计算连续负期望值天数
+        consecutive_bad = 0
+        sorted_dates = sorted(daily_pnl.keys(), reverse=True)
+
+        for date in sorted_dates:
+            pnls = daily_pnl[date]
+            if pnls:
+                day_expectancy = sum(pnls) / len(pnls)
+                if day_expectancy < 0:
+                    consecutive_bad += 1
+                else:
+                    # 遇到正期望值，中断计数
+                    break
+
+        return consecutive_bad
+
+    def _log_rollback(self, batch: Dict, degradation: Dict) -> bool:
+        """
+        记录回滚日志到 daily_monitor_log
+
+        Args:
+            batch: 批次信息
+            degradation: 退化检测结果
+
+        Returns:
+            bool: 是否记录成功
+        """
+        monitor_date = datetime.now().strftime('%Y-%m-%d')
+        alert_detail = f"batch_id={batch['batch_id']}; reason={degradation['reason']}; " \
+                       f"expectancy_drop={degradation['expectancy_drop']:.2%}; " \
+                       f"win_rate_drop={degradation['win_rate_drop']:.1f}%"
+
+        with self.dl._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO daily_monitor_log
+                (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
+                VALUES (?, 'auto_rollback', ?, 'critical', 'rollback_completed', CURRENT_TIMESTAMP)
+            """, (monitor_date, alert_detail))
+
+            return conn.execute("SELECT changes()").fetchone()[0] > 0
