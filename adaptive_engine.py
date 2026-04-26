@@ -54,16 +54,27 @@ class AdaptiveEngine:
                 'status': 'ok' | 'warning' | 'critical',
             }
         """
-        if monitor_date is None:
-            monitor_date = datetime.now().strftime('%Y-%m-%d')
+        # 实际运行日期（用于防重复和 critical 处理决策）
+        actual_run_date = datetime.now().strftime('%Y-%m-%d')
 
-        # 检查今天是否已经处理过 critical 预警（防止多次执行重复处理）
-        critical_already_handled = self._check_critical_already_handled(monitor_date)
+        if monitor_date is None:
+            monitor_date = actual_run_date
+
+        # 判断是否是"当前监控"（数据日期=运行日期）
+        # 历史数据回补不应触发参数变更，只记录监控日志
+        is_current_monitor = (monitor_date == actual_run_date)
+
+        # 防重复检查：基于实际运行日期（每天只处理一次 critical）
+        if is_current_monitor:
+            critical_already_handled = self._check_critical_already_handled(actual_run_date)
+        else:
+            # 历史数据回补：强制跳过 critical 处理
+            critical_already_handled = True
 
         # 执行每日监控（监控本身可以多次执行，数据更新时需要重新计算）
         alerts = self.monitor.run(monitor_date)
 
-        # 处理 critical 预警（仅在首次执行时处理）
+        # 处理 critical 预警（仅在当前监控且首次执行时处理）
         critical_alerts = [a for a in alerts if a['severity'] == 'critical']
         critical_handled = 0
 
@@ -72,8 +83,8 @@ class AdaptiveEngine:
                 handled = self._handle_critical_alert(alert, monitor_date)
                 if handled:
                     critical_handled += 1
-                    # 记录已处理标记
-                    self._mark_critical_handled(monitor_date, alert['type'])
+                    # 记录已处理标记（基于实际运行日期）
+                    self._mark_critical_handled(actual_run_date, alert['type'])
 
         # 确定整体状态
         if critical_alerts:
@@ -123,6 +134,23 @@ class AdaptiveEngine:
         if optimize_date is None:
             optimize_date = datetime.now().strftime('%Y-%m-%d')
 
+        # 实际运行日期
+        actual_run_date = datetime.now().strftime('%Y-%m-%d')
+
+        # 判断是否是"当前优化"（数据日期=运行日期）
+        # 历史数据回补不应触发参数变更
+        is_current_optimize = (optimize_date == actual_run_date)
+
+        if not is_current_optimize:
+            return {
+                'optimization_results': None,
+                'sandbox_validation': None,
+                'applied': 0,
+                'rejected': 0,
+                'reason': 'historical_date_not_allowed',
+                'message': '历史日期不允许执行每周优化（会修改当前生产参数）',
+            }
+
         # 判断是否是周四（每周优化日）
         dt = datetime.strptime(optimize_date, '%Y-%m-%d')
         is_thursday = dt.weekday() == 3
@@ -136,8 +164,8 @@ class AdaptiveEngine:
                 'reason': 'not_thursday',
             }
 
-        # 检查今天是否已经执行过优化（防止多次执行）
-        if self._check_optimization_already_run(optimize_date):
+        # 检查今天是否已经执行过优化（基于实际运行日期）
+        if self._check_optimization_already_run(actual_run_date):
             return {
                 'optimization_results': None,
                 'sandbox_validation': None,
@@ -146,8 +174,8 @@ class AdaptiveEngine:
                 'reason': 'already_run_today',
             }
 
-        # 检查今天是否已经有新创建的 pending 记录（优化已跑但未验证完成）
-        if self._check_has_today_pending(optimize_date):
+        # 检查今天是否已经有新创建的 pending 记录（基于实际运行日期）
+        if self._check_has_today_pending(actual_run_date):
             return {
                 'optimization_results': None,
                 'sandbox_validation': None,
