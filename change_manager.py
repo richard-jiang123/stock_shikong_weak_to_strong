@@ -610,3 +610,182 @@ class ChangeManager:
             bool: 是否拒绝成功
         """
         return self.update_status(sandbox_id, 'rejected', reason)
+
+    # ─────────────────────────────────────────────
+    # 批量回滚
+    # ─────────────────────────────────────────────
+
+    def rollback_batch(self, batch_id: str, reason: str) -> Dict:
+        """
+        回滚批次变更
+
+        Args:
+            batch_id: 批次ID
+            reason: 回滚原因
+
+        Returns:
+            dict: 包含 rolled_back, failed, snapshot_id, reason
+        """
+        # 1. 获取批次的最新快照
+        snapshot = self.get_latest_snapshot(batch_id=batch_id)
+
+        if snapshot is None:
+            return {
+                'rolled_back': 0,
+                'failed': 0,
+                'snapshot_id': None,
+                'reason': reason,
+                'error': 'No snapshot found for batch'
+            }
+
+        snapshot_id = snapshot['id']
+
+        # 2. 从快照恢复参数
+        restore_success = self.restore_snapshot(snapshot_id, reason=reason)
+
+        if not restore_success:
+            return {
+                'rolled_back': 0,
+                'failed': 0,
+                'snapshot_id': snapshot_id,
+                'reason': reason,
+                'error': 'Snapshot restore failed'
+            }
+
+        # 3. 更新 sandbox_config 标记回滚
+        rollback_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with self.dl._get_conn() as conn:
+            # 更新 applied 状态的记录为 rejected，并标记回滚信息
+            conn.execute("""
+                UPDATE sandbox_config
+                SET rollback_triggered = 1,
+                    rollback_at = ?,
+                    rollback_reason = ?,
+                    status = 'rejected'
+                WHERE batch_id = ? AND status = 'applied'
+            """, (rollback_at, reason, batch_id))
+
+            # 统计回滚数量
+            rolled_back = conn.execute("SELECT changes()").fetchone()[0]
+
+        # 4. 更新 optimization_history 标记回滚
+        with self.dl._get_conn() as conn:
+            conn.execute("""
+                UPDATE optimization_history
+                SET rollback_triggered = 1
+                WHERE batch_id = ? AND rollback_triggered = 0
+            """, (batch_id,))
+
+        return {
+            'rolled_back': rolled_back,
+            'failed': 0,
+            'snapshot_id': snapshot_id,
+            'reason': reason
+        }
+
+    def get_batch_changes(self, batch_id: str) -> List[Dict]:
+        """
+        获取批次的所有变更记录
+
+        Args:
+            batch_id: 批次ID
+
+        Returns:
+            List[Dict]: 变更记录列表，每个元素包含:
+                - id: sandbox_id
+                - param_key: 参数键
+                - sandbox_value: 沙盒值
+                - current_value: 当前值
+                - optimize_type: 优化类型
+                - status: 状态
+                - staged_at: 暂存时间
+                - applied_at: 应用时间
+                - rollback_triggered: 是否已回滚
+                - rollback_at: 回滚时间
+        """
+        with self.dl._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT id, param_key, sandbox_value, current_value, optimize_type,
+                       status, staged_at, applied_at, rollback_triggered, rollback_at
+                FROM sandbox_config
+                WHERE batch_id = ?
+                ORDER BY staged_at
+            """, (batch_id,)).fetchall()
+
+        result = []
+        for row in rows:
+            sandbox_id, param_key, sandbox_value_str, current_value_str, optimize_type, \
+                status, staged_at, applied_at, rollback_triggered, rollback_at = row
+
+            # 根据 optimize_type 解析值
+            if optimize_type == 'signal_status':
+                sandbox_value = sandbox_value_str
+                current_value = current_value_str
+            else:
+                try:
+                    sandbox_value = float(sandbox_value_str) if sandbox_value_str else None
+                except (ValueError, TypeError):
+                    sandbox_value = sandbox_value_str
+                try:
+                    current_value = float(current_value_str) if current_value_str else None
+                except (ValueError, TypeError):
+                    current_value = current_value_str
+
+            result.append({
+                'id': sandbox_id,
+                'param_key': param_key,
+                'sandbox_value': sandbox_value,
+                'current_value': current_value,
+                'optimize_type': optimize_type,
+                'status': status,
+                'staged_at': staged_at,
+                'applied_at': applied_at,
+                'rollback_triggered': rollback_triggered,
+                'rollback_at': rollback_at,
+            })
+
+        return result
+
+    def get_batch_info(self, batch_id: str) -> Optional[Dict]:
+        """
+        获取批次详细信息
+
+        Args:
+            batch_id: 批次ID
+
+        Returns:
+            Dict: 批次信息，包含:
+                - batch_id: 批次ID
+                - snapshot: 关联的快照信息（如果有）
+                - changes: 变更记录列表
+                - total_changes: 总变更数
+                - applied_count: 已应用数
+                - rollback_count: 已回滚数
+                - is_rolled_back: 批次是否已回滚
+        """
+        # 获取变更记录
+        changes = self.get_batch_changes(batch_id)
+
+        if not changes:
+            return None
+
+        # 获取关联的快照
+        snapshot = self.get_latest_snapshot(batch_id=batch_id)
+
+        # 统计状态
+        total_changes = len(changes)
+        applied_count = sum(1 for c in changes if c['status'] == 'applied')
+        rollback_count = sum(1 for c in changes if c['rollback_triggered'] == 1)
+
+        # 判断批次是否已回滚（有回滚记录）
+        is_rolled_back = rollback_count > 0
+
+        return {
+            'batch_id': batch_id,
+            'snapshot': snapshot,
+            'changes': changes,
+            'total_changes': total_changes,
+            'applied_count': applied_count,
+            'rollback_count': rollback_count,
+            'is_rolled_back': is_rolled_back,
+        }

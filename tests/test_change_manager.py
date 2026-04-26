@@ -507,6 +507,152 @@ class TestChangeManager(unittest.TestCase):
         # 验证配置未变
         self.assertEqual(self.cfg.get('first_wave_min_days'), 3)
 
+    # ─────────────────────────────────────────────
+    # 批量回滚测试
+    # ─────────────────────────────────────────────
+
+    def test_rollback_batch(self):
+        """测试：批量回滚批次变更"""
+        batch_id = 'batch_rollback_001'
+
+        # 1. 设置初始参数值
+        self.cfg.set('first_wave_min_days', 3)
+        self.cfg.set('stop_loss_buffer', 0.02)
+
+        # 2. 保存快照（参数值为 3 和 0.02）
+        snapshot_id = self.mgr.save_snapshot(
+            trigger_reason='weekly_optimize',
+            batch_id=batch_id,
+            snapshot_type='pre_change'
+        )
+
+        # 3. 暂存变更到 0.18
+        sandbox_id_1 = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=5,
+            batch_id=batch_id
+        )
+        sandbox_id_2 = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='stop_loss_buffer',
+            new_value=0.18,
+            batch_id=batch_id
+        )
+
+        # 4. 提交变更
+        self.mgr.commit_change(sandbox_id_1)
+        self.mgr.commit_change(sandbox_id_2)
+
+        # 验证参数已更新
+        cfg_before = StrategyConfig(self.db_path)
+        self.assertEqual(cfg_before.get('first_wave_min_days'), 5.0)
+        self.assertEqual(cfg_before.get('stop_loss_buffer'), 0.18)
+
+        # 5. 执行回滚
+        result = self.mgr.rollback_batch(batch_id, reason='performance_degradation')
+
+        # 6. 验证回滚结果
+        self.assertGreaterEqual(result['rolled_back'], 2)  # 至少回滚了 2 条变更
+        self.assertEqual(result['failed'], 0)
+        self.assertEqual(result['snapshot_id'], snapshot_id)
+        self.assertEqual(result['reason'], 'performance_degradation')
+
+        # 7. 验证参数已恢复到快照时的值
+        cfg_verify = StrategyConfig(self.db_path)
+        self.assertEqual(cfg_verify.get('first_wave_min_days'), 3)
+        self.assertEqual(cfg_verify.get('stop_loss_buffer'), 0.02)
+
+        # 8. 验证 sandbox_config 状态已更新为 rejected
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT status, rollback_triggered, rollback_reason
+                FROM sandbox_config
+                WHERE batch_id = ?
+            """, (batch_id,)).fetchall()
+
+            for row in rows:
+                self.assertEqual(row[0], 'rejected')
+                self.assertEqual(row[1], 1)
+                self.assertEqual(row[2], 'performance_degradation')
+
+    def test_rollback_batch_no_snapshot(self):
+        """测试：回滚不存在的批次返回错误信息"""
+        result = self.mgr.rollback_batch('nonexistent_batch', reason='test')
+
+        self.assertEqual(result['rolled_back'], 0)
+        self.assertEqual(result['failed'], 0)
+        self.assertIsNone(result['snapshot_id'])
+        self.assertIn('error', result)
+
+    def test_get_batch_changes(self):
+        """测试：获取批次变更记录"""
+        batch_id = 'batch_changes_001'
+
+        # 暂存多个变更
+        self.mgr.stage_change('strategy_config', 'first_wave_min_days', 5, batch_id)
+        self.mgr.stage_change('strategy_config', 'stop_loss_buffer', 0.03, batch_id)
+
+        # 获取变更记录
+        changes = self.mgr.get_batch_changes(batch_id)
+
+        self.assertEqual(len(changes), 2)
+
+        param_keys = [c['param_key'] for c in changes]
+        self.assertIn('first_wave_min_days', param_keys)
+        self.assertIn('stop_loss_buffer', param_keys)
+
+        # 验证变更记录字段
+        for change in changes:
+            self.assertIn('id', change)
+            self.assertIn('param_key', change)
+            self.assertIn('sandbox_value', change)
+            self.assertIn('current_value', change)
+            self.assertIn('optimize_type', change)
+            self.assertIn('status', change)
+            self.assertIn('staged_at', change)
+            self.assertIn('applied_at', change)
+            self.assertIn('rollback_triggered', change)
+            self.assertIn('rollback_at', change)
+
+    def test_get_batch_info(self):
+        """测试：获取批次详细信息"""
+        batch_id = 'batch_info_001'
+
+        # 保存快照
+        self.mgr.save_snapshot('weekly_optimize', batch_id, 'pre_change')
+
+        # 暂存并提交变更
+        sandbox_id_1 = self.mgr.stage_change('strategy_config', 'first_wave_min_days', 5, batch_id)
+        sandbox_id_2 = self.mgr.stage_change('strategy_config', 'stop_loss_buffer', 0.03, batch_id)
+
+        self.mgr.commit_change(sandbox_id_1)
+        self.mgr.commit_change(sandbox_id_2)
+
+        # 获取批次信息
+        info = self.mgr.get_batch_info(batch_id)
+
+        self.assertIsNotNone(info)
+        self.assertEqual(info['batch_id'], batch_id)
+        self.assertEqual(info['total_changes'], 2)
+        self.assertEqual(info['applied_count'], 2)
+        self.assertEqual(info['rollback_count'], 0)
+        self.assertFalse(info['is_rolled_back'])
+        self.assertIsNotNone(info['snapshot'])
+
+        # 执行回滚
+        self.mgr.rollback_batch(batch_id, reason='test_rollback')
+
+        # 再次获取批次信息
+        info_after = self.mgr.get_batch_info(batch_id)
+        self.assertTrue(info_after['is_rolled_back'])
+        self.assertGreater(info_after['rollback_count'], 0)
+
+    def test_get_batch_info_nonexistent(self):
+        """测试：获取不存在批次的信息返回 None"""
+        info = self.mgr.get_batch_info('nonexistent_batch')
+        self.assertIsNone(info)
+
 
 if __name__ == '__main__':
     unittest.main()
