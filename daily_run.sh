@@ -72,25 +72,20 @@ acquire_lock() {
     local lock_name="$1"
     local timeout="${2:-60}"
 
-    # 创建临时文件用于捕获子进程输出
-    local output_file=$(mktemp)
-
-    # 启动锁子进程（捕获输出到临时文件）
-    python3 "${SCRIPT_DIR}/process_lock.py" --acquire "${lock_name}" --timeout "${timeout}" > "$output_file" 2>&1 &
+    # 启动锁子进程（不重定向 stdin，输出直接到终端）
+    # 使用 -u 参数禁用 Python stdout 缓冲
+    python3 -u "${SCRIPT_DIR}/process_lock.py" --acquire "${lock_name}" --timeout "${timeout}" &
     LOCK_PID=$!
 
-    # 等待子进程启动并获取结果
+    # 等待子进程启动并检查存活
     sleep 1
 
-    # 检查子进程状态和输出
+    # 用 kill -0 检查进程存活（不发信号，只检查）
     if ! kill -0 "$LOCK_PID" 2>/dev/null; then
-        # 进程已退出，读取输出判断原因
+        # 进程已退出，等待获取退出码
         wait "$LOCK_PID" 2>/dev/null
         local exit_code=$?
-        local output=$(cat "$output_file" 2>/dev/null)
-        rm -f "$output_file"
-
-        if [[ "$output" == *"LOCK_TIMEOUT"* ]] || [ $exit_code -eq 1 ]; then
+        if [ $exit_code -eq 1 ]; then
             log "  ✗ 获取锁超时，可能有其他实例正在运行"
         else
             log "  ✗ 锁进程异常退出 (exit=${exit_code})"
@@ -99,35 +94,19 @@ acquire_lock() {
         exit 1
     fi
 
-    # 子进程存活，检查是否真正获取了锁（输出 LOCK_ACQUIRED）
-    local output=$(cat "$output_file" 2>/dev/null)
-    if [[ "$output" == *"LOCK_ACQUIRED"* ]]; then
-        rm -f "$output_file"
-        log "  锁已获取 (PID=${LOCK_PID})"
-    else
-        # 子进程还在等待锁，但尚未获取成功
-        # 等待一小段时间再检查
-        sleep 2
-        output=$(cat "$output_file" 2>/dev/null)
-        if [[ "$output" == *"LOCK_ACQUIRED"* ]]; then
-            rm -f "$output_file"
-            log "  锁已获取 (PID=${LOCK_PID})"
-        elif [[ "$output" == *"LOCK_TIMEOUT"* ]]; then
-            rm -f "$output_file"
-            log "  ✗ 获取锁超时，可能有其他实例正在运行"
-            end_run "fail"
-            exit 1
-        elif ! kill -0 "$LOCK_PID" 2>/dev/null; then
-            rm -f "$output_file"
-            log "  ✗ 锁进程意外退出"
-            end_run "fail"
-            exit 1
-        else
-            rm -f "$output_file"
-            log "  ✗ 无法确认锁状态，可能存在竞争"
-            end_run "fail"
-            exit 1
-        fi
+    log "  锁已获取 (PID=${LOCK_PID})"
+}
+
+# 检查锁进程是否仍然存活（运行期间调用）
+check_lock_alive() {
+    if [ -n "${LOCK_PID:-}" ] && ! kill -0 "$LOCK_PID" 2>/dev/null; then
+        log "  ✗ 锁进程已意外退出 (PID=${LOCK_PID})"
+        # 清理残留锁文件
+        python3 "${SCRIPT_DIR}/process_lock.py" --release daily_run 2>/dev/null || \
+            rm -f "${SCRIPT_DIR}/.locks/daily_run.lock" 2>/dev/null
+        unset LOCK_PID
+        end_run "fail"
+        exit 1
     fi
 }
 
@@ -384,6 +363,7 @@ with open('$LOGFILE', 'a', encoding='utf-8') as f:
 
 run_scan() {
     log "─────────────── [1/3] 扫描选股 ───────────────"
+    check_lock_alive  # 确保锁进程仍然存活
     local cmd="$PY daily_scanner.py"
     if [ -n "$SCAN_DATE" ]; then
         cmd="$cmd --date $SCAN_DATE"
@@ -403,6 +383,7 @@ run_scan() {
 
 run_track() {
     log "─────────────── [2/3] 更新跟踪 ───────────────"
+    check_lock_alive  # 确保锁进程仍然存活
     $PY pick_tracker.py --action update 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
@@ -417,6 +398,7 @@ run_track() {
 
 run_report() {
     log "─────────────── [3/3] 生成报告 ───────────────"
+    check_lock_alive  # 确保锁进程仍然存活
     $PY generate_scorecard_report.py --lookback $LOOKBACK --output tracking_report.md 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
@@ -539,6 +521,7 @@ run_scorecard() {
 
 run_optimize() {
     log "────────── 参数优化（坐标下降） ──────────"
+    check_lock_alive
     $PY strategy_optimizer.py --mode coordinate \
         --rounds $OPT_ROUNDS --sample $OPT_SAMPLE 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
@@ -554,6 +537,7 @@ run_optimize() {
 
 run_walkforward() {
     log "─────────── Walk-Forward 验证 ────────────"
+    check_lock_alive
     $PY strategy_optimizer.py --mode walkforward \
         --train-window $TRAIN_WINDOW --test-window $TEST_WINDOW --sample $OPT_SAMPLE 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
@@ -569,6 +553,7 @@ run_walkforward() {
 
 run_monitor() {
     log "─────────────── 每日监控 ───────────────"
+    check_lock_alive
     $PY adaptive_engine.py --mode daily ${SCAN_DATE:+--date $SCAN_DATE} 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
@@ -583,6 +568,7 @@ run_monitor() {
 
 run_weekly_optimize() {
     log "─────────────── 每周优化 ───────────────"
+    check_lock_alive
     $PY adaptive_engine.py --mode weekly ${SCAN_DATE:+--date $SCAN_DATE} 2>&1 | grep -vE "^\[Errno|接收数据异常|^login|^logout" | while IFS= read -r line; do
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | strip_colors >> "$LOGFILE"
