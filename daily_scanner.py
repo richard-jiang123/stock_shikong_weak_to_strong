@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_layer import get_data_layer
 from strategy_config import StrategyConfig
 from pick_tracker import PickTracker
+from normalizer import ScoreNormalizer
 
 CONFIG = {
     'first_wave_min_days': 3, 'first_wave_min_gain': 0.15,
@@ -203,7 +204,7 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
     """
     Run pattern scan for data up to end_date. Returns list of result dicts.
     Optimized: batch load data first, then fast iteration.
-    Includes sector momentum scoring.
+    Includes sector momentum scoring and score normalization.
     """
     # 提前过滤ST股票
     filtered_codes = [c for c in codes if 'ST' not in name_map.get(c, '').upper()]
@@ -232,6 +233,11 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
         momentum, is_strong = _compute_sector_momentum(group_codes, kline_cache, lookback=10)
         sector_momentum_cache[industry] = {'momentum': momentum, 'strong': is_strong}
 
+    # 初始化归一化器和权重（复用已有数据层实例）
+    normalizer = ScoreNormalizer(data_layer=dl)
+    cfg = StrategyConfig()
+    weights = cfg.get_weights()
+
     results = []
     for i, code in enumerate(filtered_codes):
         if code not in kline_cache:
@@ -251,8 +257,23 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
             score_details = r.get('score_details', {})
             score_sector = 5 if sector_strong else 0
 
-            # 添加板块动量评分
-            score = r['score'] + score_sector
+            # 构建归一化输入（使用 day_gain 对应数据库字段 score_day_gain）
+            scores_dict = {
+                'day_gain': score_details.get('score_day_gain', 0),
+                'wave_gain': score_details.get('score_wave_gain', 0),
+                'shallow_dd': score_details.get('score_shallow_dd', 0),
+                'volume': score_details.get('score_volume', 0),
+                'ma_bull': score_details.get('score_ma_bull', 0),
+                'sector': score_sector,
+                'signal_bonus': score_details.get('score_signal_bonus', 0),
+            }
+
+            # 应用归一化
+            normalized_score, norm_meta = normalizer.normalize_scores(scores_dict, weights)
+            score_base = score_details.get('score_base', 5)
+            total_score = score_base + normalized_score
+
+            # 更新原因字符串
             reasons = r['reasons']
             if sector_strong:
                 if reasons:
@@ -264,7 +285,11 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
                 '代码': code.split('.')[1], '名称': name_map.get(code, ''),
                 '现价': last['close'],
                 '涨幅': last['pct_chg'], '信号': r['sig'],
-                '评分': score, '波段涨幅': r['wg'],
+                '评分': total_score,
+                'score_normalized': normalized_score,
+                'score_raw': r['score'] - score_base,  # 原始总分不含 base
+                'normalization_meta': norm_meta,
+                '波段涨幅': r['wg'],
                 '回调': r['dd'], '量比': r['vr'],
                 '止损位': r['sl'], '入场价': r['ep'],
                 '指数': index_code,
@@ -273,11 +298,11 @@ def _scan_core(dl, codes, regime_cache, name_map, industry_map, start_date, end_
                 '行业': industry,
                 '板块强势': sector_strong,
                 '原因': reasons,
-                # 评分明细字段
-                'score_base': score_details.get('score_base', 5),
+                # 评分明细字段（用于 pick_tracker 记录）
+                'score_base': score_base,
+                'score_day_gain': score_details.get('score_day_gain', 0),
                 'score_wave_gain': score_details.get('score_wave_gain', 0),
                 'score_shallow_dd': score_details.get('score_shallow_dd', 0),
-                'score_day_gain': score_details.get('score_day_gain', 0),
                 'score_volume': score_details.get('score_volume', 0),
                 'score_ma_bull': score_details.get('score_ma_bull', 0),
                 'score_sector': score_sector,
