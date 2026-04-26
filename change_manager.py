@@ -1452,5 +1452,5 @@ if __name__ == '__main__':
         print(f"  触发回滚: {result['rollback_triggered']} 批次")
         if result['details']:
             for d in result['details']:
-                if d['degradation'].get('should_rollback'):
-                    print(f"  [回滚] {d['batch_id']}: {d['degradation']['reason']}")
+                if d['should_rollback']:
+                    print(f"  [回滚] {d['batch_id']}: {d['reason']}")
