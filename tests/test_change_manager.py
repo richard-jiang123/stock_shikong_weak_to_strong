@@ -947,6 +947,263 @@ class TestChangeManager(unittest.TestCase):
         # 没有数据，应为0
         self.assertEqual(consecutive_bad, 0)
 
+    def test_check_performance_degradation_triggers_rollback(self):
+        """测试：退化超过阈值触发回滚"""
+        batch_id = 'batch_degradation_trigger_001'
+
+        # 模拟批次是5天前应用的场景
+        five_days_ago_ts = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d %H:%M:%S')
+        five_days_ago = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+        thirty_days_ago = (datetime.now() - timedelta(days=35)).strftime('%Y-%m-%d')  # 基线范围起点
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # 先插入基线数据（positive pnl），在 [35天前, 5天前] 范围内
+        # 这些数据将在 baseline 范围 [30天前snapshot, snapshot] 内
+        with sqlite3.connect(self.db_path) as conn:
+            # 插入10条正 pnl 数据作为基线
+            for i in range(10):
+                conn.execute("""
+                    INSERT INTO pick_tracking
+                    (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                    VALUES (?, ?, ?, 'exited', ?, 4.2)
+                """, (thirty_days_ago, f'sh9000{i}', 'anomaly_no_decline', five_days_ago))
+
+        # 保存快照（snapshot_date 将被设置为模拟时间）
+        snapshot_id = self.mgr.save_snapshot('weekly_optimize', batch_id, 'pre_change')
+
+        # 暂存并提交变更
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=5,
+            batch_id=batch_id
+        )
+        self.mgr.commit_change(sandbox_id)
+
+        # 更新 applied_at 和 snapshot_date 到5天前
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE sandbox_config SET applied_at = ? WHERE batch_id = ?
+            """, (five_days_ago_ts, batch_id))
+            conn.execute("""
+                UPDATE param_snapshot SET snapshot_date = ? WHERE id = ?
+            """, (five_days_ago_ts, snapshot_id))
+
+            # 插入当前数据（negative pnl），在 [5天前, 今天] 范围内
+            for i in range(15):
+                conn.execute("""
+                    INSERT INTO pick_tracking
+                    (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                    VALUES (?, ?, ?, 'exited', ?, -5.0)
+                """, (five_days_ago, f'sh6000{i}', 'anomaly_no_decline', today))
+
+        # 获取批次信息
+        batches = self.mgr.get_applied_batches_in_monitor_window()
+        target_batch = next(b for b in batches if b['batch_id'] == batch_id)
+
+        # 检查性能退化
+        degradation = self.mgr.check_performance_degradation(target_batch)
+
+        # 验证触发回滚
+        # baseline: expectancy=4.2, win_rate=100%, sample_count=10
+        # current: expectancy=-5.0, win_rate=0, sample_count=15
+        # expectancy_drop = (4.2 - (-5.0)) / 4.2 ≈ 2.19 > 0.3
+        # win_rate_drop = 100 - 0 = 100 > 10
+        self.assertTrue(degradation['should_rollback'])
+        self.assertIn('expectancy_drop', degradation['reason'])
+        self.assertGreater(degradation['expectancy_drop'], 0.3)  # 下降超过30%
+
+    def test_check_consecutive_bad_trading_days_with_data(self):
+        """测试：有数据时连续负期望值天数计算"""
+        batch_id = 'batch_consecutive_with_data_001'
+
+        # 保存快照
+        self.mgr.save_snapshot('weekly_optimize', batch_id, 'pre_change')
+
+        # 暂存并提交变更
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=5,
+            batch_id=batch_id
+        )
+        self.mgr.commit_change(sandbox_id)
+
+        # 模拟批次是5天前应用的（手动更新 applied_at）
+        five_days_ago_ts = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d %H:%M:%S')
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE sandbox_config SET applied_at = ? WHERE batch_id = ?
+            """, (five_days_ago_ts, batch_id))
+
+        # 获取批次信息（此时 applied_at 已更新为5天前）
+        batches = self.mgr.get_applied_batches_in_monitor_window()
+        target_batch = next(b for b in batches if b['batch_id'] == batch_id)
+
+        # 插入多个日期的负 pnl 数据（连续5天负期望值）
+        today = datetime.now().strftime('%Y-%m-%d')
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        two_days_ago = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
+        three_days_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+        four_days_ago = (datetime.now() - timedelta(days=4)).strftime('%Y-%m-%d')
+        five_days_ago = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+
+        with sqlite3.connect(self.db_path) as conn:
+            # 连续5天负 pnl（每天2条），exit_date 从今天往前5天
+            for day in [today, yesterday, two_days_ago, three_days_ago, four_days_ago]:
+                for i in range(2):
+                    conn.execute("""
+                        INSERT INTO pick_tracking
+                        (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                        VALUES (?, ?, ?, 'exited', ?, -2.0)
+                    """, (five_days_ago, f'sh600{day.replace("-", "")}{i}', 'anomaly_no_decline', day))
+
+            # 第6天插入正 pnl（中断连续负期望值）
+            conn.execute("""
+                INSERT INTO pick_tracking
+                (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                VALUES (?, ?, ?, 'exited', ?, 5.0)
+            """, (five_days_ago, 'sh60000100', 'anomaly_no_decline', five_days_ago))
+
+        # 检查连续负期望值天数
+        consecutive_bad = self.mgr._check_consecutive_bad_trading_days(target_batch['applied_at'])
+
+        # 验证连续5天负期望值（从今天往前5天，直到遇到第6天的正 pnl）
+        self.assertEqual(consecutive_bad, 5)
+
+    def test_log_rollback(self):
+        """测试：_log_rollback 写入 daily_monitor_log"""
+        batch_id = 'batch_log_rollback_001'
+
+        # 构造 batch 和 degradation 信息
+        batch = {
+            'batch_id': batch_id,
+            'applied_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'monitor_days_elapsed': 5
+        }
+
+        degradation = {
+            'should_rollback': True,
+            'reason': 'expectancy_drop_45.0%; win_rate_drop_15.0%',
+            'expectancy_drop': 0.45,
+            'win_rate_drop': 15.0
+        }
+
+        # 调用 _log_rollback
+        result = self.mgr._log_rollback(batch, degradation)
+
+        # 验证写入成功
+        self.assertTrue(result)
+
+        # 验证 daily_monitor_log 表有记录
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT monitor_date, alert_type, alert_detail, severity, action_taken
+                FROM daily_monitor_log
+                WHERE alert_type = 'auto_rollback'
+                ORDER BY id DESC LIMIT 1
+            """).fetchone()
+
+            self.assertIsNotNone(row)
+            self.assertEqual(row[1], 'auto_rollback')
+            self.assertEqual(row[3], 'critical')
+            self.assertEqual(row[4], 'rollback_completed')
+            self.assertIn(batch_id, row[2])
+            self.assertIn('expectancy_drop', row[2])
+
+    def test_monitor_and_rollback_triggers(self):
+        """测试：monitor_and_rollback 检测到退化并触发回滚"""
+        batch_id = 'batch_monitor_trigger_001'
+
+        # 模拟批次是5天前应用的场景
+        five_days_ago_ts = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d %H:%M:%S')
+        five_days_ago = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+        thirty_days_ago = (datetime.now() - timedelta(days=35)).strftime('%Y-%m-%d')  # 基线范围起点
+        today = datetime.now().strftime('%Y-%m-%d')
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        two_days_ago = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
+        three_days_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+        four_days_ago = (datetime.now() - timedelta(days=4)).strftime('%Y-%m-%d')
+
+        # 先插入基线数据（positive pnl）
+        with sqlite3.connect(self.db_path) as conn:
+            for i in range(10):
+                conn.execute("""
+                    INSERT INTO pick_tracking
+                    (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                    VALUES (?, ?, ?, 'exited', ?, 4.2)
+                """, (thirty_days_ago, f'sh9000{i}', 'anomaly_no_decline', five_days_ago))
+
+        # 保存快照
+        snapshot_id = self.mgr.save_snapshot('weekly_optimize', batch_id, 'pre_change')
+
+        # 暂存并提交变更
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=5,
+            batch_id=batch_id
+        )
+        self.mgr.commit_change(sandbox_id)
+
+        # 更新 applied_at 和 snapshot_date
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE sandbox_config SET applied_at = ? WHERE batch_id = ?
+            """, (five_days_ago_ts, batch_id))
+            conn.execute("""
+                UPDATE param_snapshot SET snapshot_date = ? WHERE id = ?
+            """, (five_days_ago_ts, snapshot_id))
+
+            # 插入当前数据（negative pnl）
+            for i in range(15):
+                conn.execute("""
+                    INSERT INTO pick_tracking
+                    (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                    VALUES (?, ?, ?, 'exited', ?, -5.0)
+                """, (five_days_ago, f'sh6000{i}', 'anomaly_no_decline', today))
+
+            # 连续5天负 pnl（触发 consecutive_bad_days）
+            for day in [today, yesterday, two_days_ago, three_days_ago, four_days_ago]:
+                for i in range(2):
+                    conn.execute("""
+                        INSERT INTO pick_tracking
+                        (pick_date, code, signal_type, status, exit_date, final_pnl_pct)
+                        VALUES (?, ?, ?, 'exited', ?, -2.0)
+                    """, (five_days_ago, f'sh600{day.replace("-", "")}{i}', 'anomaly_no_decline', day))
+
+        # 执行监控和回滚
+        result = self.mgr.monitor_and_rollback()
+
+        # 验证触发回滚
+        self.assertGreater(result['checked'], 0)
+        self.assertGreater(result['rollback_triggered'], 0)
+
+        # 验证 daily_monitor_log 有记录
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT alert_type, severity, action_taken
+                FROM daily_monitor_log
+                WHERE alert_type = 'auto_rollback'
+                ORDER BY id DESC LIMIT 1
+            """).fetchone()
+
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], 'auto_rollback')
+            self.assertEqual(row[1], 'critical')
+            self.assertEqual(row[2], 'rollback_completed')
+
+        # 验证 sandbox_config 状态已更新为 rejected
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT status, rollback_triggered, rollback_reason
+                FROM sandbox_config
+                WHERE batch_id = ?
+            """, (batch_id,)).fetchone()
+
+            self.assertEqual(row[0], 'rejected')
+            self.assertEqual(row[1], 1)
+
 
 if __name__ == '__main__':
     unittest.main()
