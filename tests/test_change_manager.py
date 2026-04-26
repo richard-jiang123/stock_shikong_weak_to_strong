@@ -583,7 +583,125 @@ class TestChangeManager(unittest.TestCase):
         self.assertEqual(result['rolled_back'], 0)
         self.assertEqual(result['failed'], 0)
         self.assertIsNone(result['snapshot_id'])
-        self.assertIn('error', result)
+        self.assertEqual(result['reason'], 'no_snapshot_found')
+
+    def test_rollback_batch_partial_applied(self):
+        """测试：回滚混合状态的批次（staged/applied混合）"""
+        batch_id = 'batch_partial_rollback_001'
+
+        # 1. 设置初始参数值
+        self.cfg.set('first_wave_min_days', 3)
+        self.cfg.set('stop_loss_buffer', 0.02)
+
+        # 2. 保存快照
+        snapshot_id = self.mgr.save_snapshot(
+            trigger_reason='weekly_optimize',
+            batch_id=batch_id,
+            snapshot_type='pre_change'
+        )
+
+        # 3. 暂存多个变更
+        sandbox_id_1 = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=5,
+            batch_id=batch_id
+        )
+        sandbox_id_2 = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='stop_loss_buffer',
+            new_value=0.05,
+            batch_id=batch_id
+        )
+        sandbox_id_3 = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='max_hold_days',
+            new_value=10,
+            batch_id=batch_id
+        )
+
+        # 4. 只提交部分变更（sandbox_id_1 和 sandbox_id_2）
+        self.mgr.commit_change(sandbox_id_1)
+        self.mgr.commit_change(sandbox_id_2)
+
+        # sandbox_id_3 仍为 staged 状态
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT status FROM sandbox_config WHERE id = ?
+            """, (sandbox_id_3,)).fetchone()
+            self.assertEqual(row[0], 'staged')
+
+        # 5. 验证已提交的参数已更新
+        cfg_before = StrategyConfig(self.db_path)
+        self.assertEqual(cfg_before.get('first_wave_min_days'), 5.0)
+        self.assertEqual(cfg_before.get('stop_loss_buffer'), 0.05)
+
+        # 6. 执行回滚
+        result = self.mgr.rollback_batch(batch_id, reason='test_partial_rollback')
+
+        # 7. 验证回滚结果：应该回滚所有 3 条记录（包括 staged 状态的）
+        self.assertEqual(result['rolled_back'], 3)
+        self.assertEqual(result['failed'], 0)
+        self.assertEqual(result['snapshot_id'], snapshot_id)
+
+        # 8. 验证参数已恢复到快照时的值
+        cfg_verify = StrategyConfig(self.db_path)
+        self.assertEqual(cfg_verify.get('first_wave_min_days'), 3)
+        self.assertEqual(cfg_verify.get('stop_loss_buffer'), 0.02)
+
+        # 9. 验证所有 sandbox_config 记录状态已更新为 rejected
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT status, rollback_triggered FROM sandbox_config
+                WHERE batch_id = ?
+            """, (batch_id,)).fetchall()
+
+            for row in rows:
+                self.assertEqual(row[0], 'rejected')
+                self.assertEqual(row[1], 1)
+
+    def test_rollback_batch_validating_status(self):
+        """测试：回滚 validating 状态的记录"""
+        batch_id = 'batch_validating_rollback_001'
+
+        # 1. 保存快照
+        snapshot_id = self.mgr.save_snapshot(
+            trigger_reason='weekly_optimize',
+            batch_id=batch_id,
+            snapshot_type='pre_change'
+        )
+
+        # 2. 暂存变更并设置为 validating 状态
+        sandbox_id = self.mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='first_wave_min_days',
+            new_value=7,
+            batch_id=batch_id
+        )
+        self.mgr.update_status(sandbox_id, 'validating')
+
+        # 验证状态为 validating
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT status FROM sandbox_config WHERE id = ?
+            """, (sandbox_id,)).fetchone()
+            self.assertEqual(row[0], 'validating')
+
+        # 3. 执行回滚
+        result = self.mgr.rollback_batch(batch_id, reason='validation_failed')
+
+        # 4. 验证回滚结果
+        self.assertEqual(result['rolled_back'], 1)
+        self.assertEqual(result['snapshot_id'], snapshot_id)
+
+        # 5. 验证 sandbox_config 状态已更新为 rejected
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT status, rollback_triggered FROM sandbox_config
+                WHERE batch_id = ?
+            """, (batch_id,)).fetchone()
+            self.assertEqual(row[0], 'rejected')
+            self.assertEqual(row[1], 1)
 
     def test_get_batch_changes(self):
         """测试：获取批次变更记录"""

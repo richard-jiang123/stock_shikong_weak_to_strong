@@ -617,7 +617,7 @@ class ChangeManager:
 
     def rollback_batch(self, batch_id: str, reason: str) -> Dict:
         """
-        回滚批次变更
+        回滚批次变更（原子操作：所有更新在单一事务内完成）
 
         Args:
             batch_id: 批次ID
@@ -626,7 +626,7 @@ class ChangeManager:
         Returns:
             dict: 包含 rolled_back, failed, snapshot_id, reason
         """
-        # 1. 获取批次的最新快照
+        # 1. 获取快照（事务外读取，只读操作）
         snapshot = self.get_latest_snapshot(batch_id=batch_id)
 
         if snapshot is None:
@@ -634,53 +634,87 @@ class ChangeManager:
                 'rolled_back': 0,
                 'failed': 0,
                 'snapshot_id': None,
-                'reason': reason,
-                'error': 'No snapshot found for batch'
+                'reason': 'no_snapshot_found'
             }
 
         snapshot_id = snapshot['id']
 
-        # 2. 从快照恢复参数
-        restore_success = self.restore_snapshot(snapshot_id, reason=reason)
-
-        if not restore_success:
+        # 检查快照是否已恢复
+        snapshot_full = self.get_snapshot_by_id(snapshot_id)
+        if snapshot_full['is_restored'] == 1:
             return {
                 'rolled_back': 0,
                 'failed': 0,
                 'snapshot_id': snapshot_id,
-                'reason': reason,
-                'error': 'Snapshot restore failed'
+                'reason': 'snapshot_already_restored'
             }
 
-        # 3. 更新 sandbox_config 标记回滚
         rollback_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # 2. 所有更新在单一事务内完成（原子性）
         with self.dl._get_conn() as conn:
-            # 更新 applied 状态的记录为 rejected，并标记回滚信息
+            # a. 恢复 strategy_config 参数（从快照内联）
+            for key, value in snapshot['params'].items():
+                conn.execute("""
+                    INSERT OR REPLACE INTO strategy_config
+                    (param_key, param_value, description, category, updated_at)
+                    VALUES (?, ?,
+                            COALESCE((SELECT description FROM strategy_config WHERE param_key=?), ''),
+                            COALESCE((SELECT category FROM strategy_config WHERE param_key=?), 'unknown'),
+                            ?)
+                """, (key, value, key, key, rollback_at))
+
+            # b. 恢复 signal_status 状态（从快照内联）
+            for item in snapshot['signal_status']:
+                conn.execute("""
+                    UPDATE signal_status SET
+                        status_level = ?, weight_multiplier = ?, last_check_date = datetime('now')
+                    WHERE signal_type = ?
+                """, (item['status_level'], item['weight_multiplier'], item['signal_type']))
+
+            # c. 恢复 environment 参数（从快照内联）
+            for key, value in snapshot['environment'].items():
+                conn.execute("""
+                    INSERT OR REPLACE INTO strategy_config
+                    (param_key, param_value, description, category, updated_at)
+                    VALUES (?, ?,
+                            COALESCE((SELECT description FROM strategy_config WHERE param_key=?), ''),
+                            COALESCE((SELECT category FROM strategy_config WHERE param_key=?), 'environment'),
+                            ?)
+                """, (key, value, key, key, rollback_at))
+
+            # d. 更新 sandbox_config（处理所有相关状态）
             conn.execute("""
                 UPDATE sandbox_config
-                SET rollback_triggered = 1,
-                    rollback_at = ?,
-                    rollback_reason = ?,
-                    status = 'rejected'
-                WHERE batch_id = ? AND status = 'applied'
+                SET rollback_triggered = 1, rollback_at = ?, rollback_reason = ?, status = 'rejected'
+                WHERE batch_id = ? AND status IN ('staged', 'validating', 'passed', 'applied')
             """, (rollback_at, reason, batch_id))
 
-            # 统计回滚数量
-            rolled_back = conn.execute("SELECT changes()").fetchone()[0]
-
-        # 4. 更新 optimization_history 标记回滚
-        with self.dl._get_conn() as conn:
+            # e. 更新 optimization_history
             conn.execute("""
                 UPDATE optimization_history
                 SET rollback_triggered = 1, rollback_at = ?, rollback_reason = ?
                 WHERE batch_id = ? AND rollback_triggered = 0
             """, (rollback_at, reason, batch_id))
 
+            # f. 标记快照为已恢复
+            conn.execute("""
+                UPDATE param_snapshot SET is_restored = 1, restored_at = ?, restore_reason = ?
+                WHERE id = ?
+            """, (rollback_at, reason, snapshot_id))
+
+        # 3. 统计回滚数量
+        with self.dl._get_conn() as conn:
+            rolled_count = conn.execute("""
+                SELECT COUNT(*) FROM sandbox_config
+                WHERE batch_id = ? AND rollback_triggered = 1
+            """, (batch_id,)).fetchone()[0]
+
         return {
-            'rolled_back': rolled_back,
+            'rolled_back': rolled_count,
             'failed': 0,
             'snapshot_id': snapshot_id,
-            'reason': reason
+            'reason': reason,
         }
 
     def get_batch_changes(self, batch_id: str) -> List[Dict]:
