@@ -337,3 +337,255 @@ class ChangeManager:
             'restore_reason': row[10],
             'created_at': row[11],
         }
+
+    # ─────────────────────────────────────────────
+    # 参数隔离（沙盒配置）
+    # ─────────────────────────────────────────────
+
+    def stage_change(self, optimize_type: str, param_key: str, new_value,
+                     batch_id: str, current_value=None) -> int:
+        """
+        暂存变更到沙盒配置（不影响实际配置）
+
+        Args:
+            optimize_type: 优化类型 ('signal_status' | 'strategy_config')
+            param_key: 参数键名（signal_type 或 strategy_config 的 key）
+            new_value: 新值
+            batch_id: 批次ID
+            current_value: 当前值，如果为 None 则自动获取
+
+        Returns:
+            sandbox_id: 沙盒记录ID
+        """
+        # 自动获取当前值
+        if current_value is None:
+            if optimize_type == 'signal_status':
+                # 从 signal_status 表获取当前 status_level
+                with self.dl._get_conn() as conn:
+                    row = conn.execute("""
+                        SELECT status_level FROM signal_status WHERE signal_type = ?
+                    """, (param_key,)).fetchone()
+                    current_value = row[0] if row else None
+            else:
+                # 从 strategy_config 获取当前值
+                current_value = self.cfg.get(param_key)
+
+        # 转换为字符串存储
+        sandbox_value_str = str(new_value)
+        current_value_str = str(current_value) if current_value is not None else None
+
+        # 尝试插入，如果已存在则更新
+        with self.dl._get_conn() as conn:
+            try:
+                cursor = conn.execute("""
+                    INSERT INTO sandbox_config
+                    (batch_id, param_key, sandbox_value, current_value, optimize_type, status)
+                    VALUES (?, ?, ?, ?, ?, 'staged')
+                """, (batch_id, param_key, sandbox_value_str, current_value_str, optimize_type))
+                sandbox_id = cursor.lastrowid
+            except Exception:
+                # 已存在，更新
+                conn.execute("""
+                    UPDATE sandbox_config
+                    SET sandbox_value = ?, current_value = ?, optimize_type = ?, status = 'staged',
+                        staged_at = CURRENT_TIMESTAMP
+                    WHERE param_key = ? AND batch_id = ?
+                """, (sandbox_value_str, current_value_str, optimize_type, param_key, batch_id))
+                cursor = conn.execute("""
+                    SELECT id FROM sandbox_config WHERE param_key = ? AND batch_id = ?
+                """, (param_key, batch_id))
+                sandbox_id = cursor.fetchone()[0]
+
+        return sandbox_id
+
+    def get_staged_params(self, batch_id: str) -> List[Dict]:
+        """
+        获取批次的暂存参数列表
+
+        Args:
+            batch_id: 批次ID
+
+        Returns:
+            List[Dict]: 暂存参数列表，每个元素包含:
+                - id: sandbox_id
+                - batch_id: 批次ID
+                - param_key: 参数键
+                - sandbox_value: 沙盒值（已转换类型）
+                - current_value: 当前值（已转换类型）
+                - optimize_type: 优化类型
+                - status: 状态
+                - staged_at: 暂存时间
+        """
+        with self.dl._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT id, batch_id, param_key, sandbox_value, current_value,
+                       optimize_type, status, staged_at
+                FROM sandbox_config
+                WHERE batch_id = ? AND status IN ('staged', 'validating', 'passed')
+                ORDER BY staged_at
+            """, (batch_id,)).fetchall()
+
+        result = []
+        for row in rows:
+            sandbox_id, batch_id_val, param_key, sandbox_value_str, current_value_str, \
+                optimize_type, status, staged_at = row
+
+            # 根据 optimize_type 解析值
+            if optimize_type == 'signal_status':
+                # signal_status 保持字符串
+                sandbox_value = sandbox_value_str
+                current_value = current_value_str
+            else:
+                # strategy_config 尝试转换为数值
+                try:
+                    sandbox_value = float(sandbox_value_str) if sandbox_value_str else None
+                except (ValueError, TypeError):
+                    sandbox_value = sandbox_value_str
+                try:
+                    current_value = float(current_value_str) if current_value_str else None
+                except (ValueError, TypeError):
+                    current_value = current_value_str
+
+            result.append({
+                'id': sandbox_id,
+                'batch_id': batch_id_val,
+                'param_key': param_key,
+                'sandbox_value': sandbox_value,
+                'current_value': current_value,
+                'optimize_type': optimize_type,
+                'status': status,
+                'staged_at': staged_at,
+            })
+
+        return result
+
+    def get_all_staged_batches(self) -> List[Dict]:
+        """
+        获取所有暂存批次列表
+
+        Returns:
+            List[Dict]: 批次列表，每个元素包含:
+                - batch_id: 批次ID
+                - staged_at: 暂存时间（最早的）
+                - change_count: 变更数量
+        """
+        with self.dl._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT batch_id, MIN(staged_at) as staged_at, COUNT(*) as change_count
+                FROM sandbox_config
+                WHERE status IN ('staged', 'validating', 'passed')
+                GROUP BY batch_id
+                ORDER BY staged_at DESC
+            """).fetchall()
+
+        return [
+            {
+                'batch_id': row[0],
+                'staged_at': row[1],
+                'change_count': row[2],
+            }
+            for row in rows
+        ]
+
+    def update_status(self, sandbox_id: int, status: str, reason: str = None) -> bool:
+        """
+        更新沙盒记录状态
+
+        Args:
+            sandbox_id: 沙盒记录ID
+            status: 新状态 ('staged' | 'validating' | 'passed' | 'applied' | 'rejected')
+            reason: 拒绝原因（仅 rejected 状态需要）
+
+        Returns:
+            bool: 是否更新成功
+        """
+        with self.dl._get_conn() as conn:
+            # 根据状态设置相应的时间戳
+            if status == 'validating':
+                conn.execute("""
+                    UPDATE sandbox_config
+                    SET status = ?, validation_started_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (status, sandbox_id))
+            elif status == 'passed':
+                conn.execute("""
+                    UPDATE sandbox_config
+                    SET status = ?, validated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (status, sandbox_id))
+            elif status == 'applied':
+                conn.execute("""
+                    UPDATE sandbox_config
+                    SET status = ?, applied_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (status, sandbox_id))
+            elif status == 'rejected':
+                conn.execute("""
+                    UPDATE sandbox_config
+                    SET status = ?, rejected_at = CURRENT_TIMESTAMP, rejection_reason = ?
+                    WHERE id = ?
+                """, (status, reason, sandbox_id))
+            else:
+                # 默认状态（如 'staged'）
+                conn.execute("""
+                    UPDATE sandbox_config SET status = ? WHERE id = ?
+                """, (status, sandbox_id))
+
+            return conn.execute("SELECT changes()").fetchone()[0] > 0
+
+    def commit_change(self, sandbox_id: int) -> bool:
+        """
+        提交变更（将沙盒值写入实际配置）
+
+        Args:
+            sandbox_id: 沙盒记录ID
+
+        Returns:
+            bool: 是否提交成功
+        """
+        # 1. 读取沙盒记录
+        with self.dl._get_conn() as conn:
+            row = conn.execute("""
+                SELECT param_key, sandbox_value, current_value, optimize_type
+                FROM sandbox_config WHERE id = ?
+            """, (sandbox_id,)).fetchone()
+
+        if row is None:
+            return False
+
+        param_key, sandbox_value_str, current_value_str, optimize_type = row
+
+        # 2. 根据 optimize_type 转换值并写入
+        if optimize_type == 'signal_status':
+            # signal_status: 写入 signal_status 表
+            new_status = sandbox_value_str
+            weight_multiplier = get_weight_multiplier(new_status)
+            with self.dl._get_conn() as conn:
+                conn.execute("""
+                    UPDATE signal_status
+                    SET status_level = ?, weight_multiplier = ?, last_check_date = datetime('now')
+                    WHERE signal_type = ?
+                """, (new_status, weight_multiplier, param_key))
+        else:
+            # strategy_config: 转换为数值并写入
+            try:
+                new_value = float(sandbox_value_str)
+            except (ValueError, TypeError):
+                new_value = sandbox_value_str
+            self.cfg.set(param_key, new_value)
+
+        # 3. 更新沙盒状态为 applied
+        return self.update_status(sandbox_id, 'applied')
+
+    def reject_change(self, sandbox_id: int, reason: str) -> bool:
+        """
+        拒绝变更
+
+        Args:
+            sandbox_id: 沙盒记录ID
+            reason: 拒绝原因
+
+        Returns:
+            bool: 是否拒绝成功
+        """
+        return self.update_status(sandbox_id, 'rejected', reason)
