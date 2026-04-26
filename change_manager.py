@@ -1229,7 +1229,7 @@ class ChangeManager:
 
         with self.dl._get_conn() as conn:
             conn.execute("""
-                INSERT INTO daily_monitor_log
+                INSERT OR IGNORE INTO daily_monitor_log
                 (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
                 VALUES (?, 'auto_rollback', ?, 'critical', 'rollback_completed', CURRENT_TIMESTAMP)
             """, (monitor_date, alert_detail))

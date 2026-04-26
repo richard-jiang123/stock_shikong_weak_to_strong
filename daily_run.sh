@@ -75,6 +75,9 @@ acquire_lock() {
     # 创建临时文件用于捕获子进程输出
     local output_file=$(mktemp)
 
+    # 输出开始等待提示
+    log "  正在获取锁..."
+
     # 启动锁子进程（输出到临时文件）
     # 使用 -u 禁用 Python stdout 缓冲
     python3 -u "${SCRIPT_DIR}/process_lock.py" --acquire "${lock_name}" --timeout "${timeout}" > "$output_file" 2>&1 &
@@ -86,11 +89,21 @@ acquire_lock() {
     local max_wait=$((timeout + 5))  # 比 Python timeout 多一点
     local current_time
     local elapsed
+    local last_progress=0
+    local progress_interval=10  # 每10秒输出一次进度
 
     while true; do
         # 计算已等待时间（秒）
         current_time=$(date '+%s')
         elapsed=$((current_time - start_time))
+
+        # 进度提示：每10秒输出一次（显示其他实例持有锁）
+        if [ $elapsed -ge $last_progress ] && [ $elapsed -lt $max_wait ]; then
+            if [ $elapsed -gt 0 ]; then
+                log "  ⏳ 等待其他实例释放锁... (${elapsed}秒/${timeout}秒超时)"
+            fi
+            last_progress=$((elapsed + progress_interval))
+        fi
 
         # 超时检查
         if [ $elapsed -ge $max_wait ]; then
@@ -116,7 +129,8 @@ acquire_lock() {
             rm -f "$output_file"
 
             if [[ "$result" == *"LOCK_TIMEOUT"* ]] || [ $exit_code -eq 1 ]; then
-                log "  ✗ 获取锁超时，可能有其他实例正在运行"
+                log "  ✗ 获取锁超时，其他实例正在运行"
+                log "  提示: 请等待当前实例完成后再运行，或手动清理锁文件 .locks/${lock_name}.lock"
             elif [[ "$result" == *"LOCK_ACQUIRED"* ]]; then
                 # 进程已退出但确实获取了锁（不应发生，但处理）
                 log "  ✗ 锁进程意外退出（获取锁后退出）"
@@ -132,14 +146,15 @@ acquire_lock() {
         local result=$(cat "$output_file" 2>/dev/null)
         if [[ "$result" == *"LOCK_ACQUIRED"* ]]; then
             rm -f "$output_file"
-            log "  锁已获取 (PID=${LOCK_PID}, 等待${elapsed}秒)"
+            log "  ✓ 锁已获取 (PID=${LOCK_PID}, 等待${elapsed}秒)"
             return 0  # 成功
         fi
 
         # 检查是否已输出 LOCK_TIMEOUT（进程可能还在等待但已超时）
         if [[ "$result" == *"LOCK_TIMEOUT"* ]]; then
             rm -f "$output_file"
-            log "  ✗ 获取锁超时，可能有其他实例正在运行"
+            log "  ✗ 获取锁超时，其他实例正在运行"
+            log "  提示: 请等待当前实例完成后再运行，或手动清理锁文件 .locks/${lock_name}.lock"
             unset LOCK_PID
             end_run "fail"
             exit 1

@@ -295,7 +295,7 @@ class DailyMonitor:
 
             for alert in alerts:
                 conn.execute("""
-                    INSERT INTO daily_monitor_log
+                    INSERT OR IGNORE INTO daily_monitor_log
                     (monitor_date, alert_type, alert_detail, severity, action_taken)
                     VALUES (?, ?, ?, ?, 'logged')
                 """, (monitor_date, alert['type'], alert['detail'], alert['severity']))

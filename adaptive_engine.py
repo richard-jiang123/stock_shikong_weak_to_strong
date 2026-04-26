@@ -401,7 +401,7 @@ class AdaptiveEngine:
         """记录 critical 预警"""
         with self.dl._get_conn() as conn:
             conn.execute("""
-                INSERT INTO daily_monitor_log
+                INSERT OR IGNORE INTO daily_monitor_log
                 (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
                 VALUES (?, ?, ?, ?, 'logged', datetime('now'))
             """, (monitor_date, alert['type'], alert['detail'], 'critical'))
@@ -420,7 +420,7 @@ class AdaptiveEngine:
         """标记今天已处理某个类型的 critical 预警"""
         with self.dl._get_conn() as conn:
             conn.execute("""
-                INSERT INTO daily_monitor_log
+                INSERT OR IGNORE INTO daily_monitor_log
                 (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
                 VALUES (?, ?, '', 'critical', 'handled', datetime('now'))
             """, (monitor_date, alert_type))
@@ -433,7 +433,7 @@ class AdaptiveEngine:
             elif method == 'log':
                 with self.dl._get_conn() as conn:
                     conn.execute("""
-                        INSERT INTO daily_monitor_log
+                        INSERT OR IGNORE INTO daily_monitor_log
                         (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
                         VALUES (?, 'critical_action', ?, 'critical', ?, datetime('now'))
                     """, (datetime.now().strftime('%Y-%m-%d'), message, 'notified'))
