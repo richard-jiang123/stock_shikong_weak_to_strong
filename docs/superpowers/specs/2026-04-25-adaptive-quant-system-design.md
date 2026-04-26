@@ -24,14 +24,18 @@
 │  │ daily_monitor.py│  │weekly_optimizer │  │sandbox_validator.py │  │
 │  │ 每日监控        │  │每周四层优化      │  │沙盒验证            │  │
 │  │ 异常预警        │  │参数/评分/信号    │  │实盘测试            │  │
-│  │ 环境感知        │  │环境感知调整      │  │                    │  │
+│  │ 环境感知        │  │环境感知调整      │  │分级阈值验证        │  │
 │  └────────┬────────┘  └────────┬────────┘  └────────┬────────────┘  │
 │           │                    │                    │               │
 │           └────────────────────┼────────────────────┘               │
 │                                ▼                                    │
 │  ┌────────────────────────────────────────────────────────────────┐ │
-│  │ optimization_history.py                                        │ │
-│  │ 变更记录 + 追溯分析 + 回滚机制                                  │ │
+│  │ adaptive_engine.py 内置变更管理                                 │ │
+│  │ 变更记录 + 追溯分析 + 回滚机制                                   │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ normalizer.py 评分归一化                                        │ │
+│  │ 基于历史样本全局统计 + 渐进置信度                                │ │
 │  └────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────┘
                                  │
@@ -43,10 +47,10 @@
 │  │ 统一参数管理    │  │ 信号状态管理    │  │ 参数变更历史        │  │
 │  │ (含评分权重)    │  │ (期望值+置信度) │  │                    │  │
 │  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
-│  ┌─────────────────┐  ┌─────────────────┐                           │
-│  │daily_monitor_log│  │ market_regime   │                           │
-│  │ 每日监控日志    │  │ 环境状态记录    │                           │
-│  └─────────────────┘  └─────────────────┘                           │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
+│  │daily_monitor_log│  │ market_regime   │  │trading_day_cache    │  │
+│  │ 每日监控日志    │  │ 环境状态记录    │  │交易日缓存          │  │
+│  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -142,7 +146,7 @@ Step 3: 信号层状态检查 (期望值+Wilson置信界)
   └── 写入sandbox待验证
 
 Step 4: 冷启动检查
-  ├── 若某信号退出样本<5笔 → 保持active状态
+  ├── 若某信号退出样本<10笔 → 保持active状态
   └── 记录样本不足状态，不做降级判断
 ```
 
@@ -261,6 +265,90 @@ def get_signal_confidence(signal_stats):
 | 50笔+ | >= 正式期望值×0.98 | 接近等效即可 |
 
 核心逻辑：样本少 → 验证更严格 → 不轻易变更
+
+分级阈值实现代码：
+```python
+# sandbox_validator.py 新增分级阈值函数
+
+def get_sample_adjusted_threshold(sample_count, base_expectancy):
+    """
+    根据样本量动态调整验证阈值
+    
+    样本少时要求更严格，样本充足时放宽要求
+    
+    Args:
+        sample_count: 验证窗口内的退出样本数
+        base_expectancy: 正式参数的期望值（基准）
+    
+    Returns:
+        required_expectancy: 样本调整后的要求期望值
+        threshold_multiplier: 阈值乘数因子
+    """
+    TIERED_THRESHOLDS = {
+        # 样本量下限 → (阈值乘数, 说明)
+        10: (1.15, '样本少，要求更高'),
+        20: (1.08, '中等保守'),
+        30: (1.02, '允许小幅下降'),
+        50: (0.98, '接近等效即可'),
+    }
+    
+    # 找到适用的阈值级别
+    multiplier = 1.15  # 默认最严格
+    reason = '样本不足10笔，使用最严格阈值'
+    
+    for threshold_samples, (mult, desc) in sorted(TIERED_THRESHOLDS.items(), reverse=True):
+        if sample_count >= threshold_samples:
+            multiplier = mult
+            reason = desc
+            break
+    
+    required_expectancy = base_expectancy * multiplier
+    
+    return {
+        'required_expectancy': required_expectancy,
+        'multiplier': multiplier,
+        'reason': reason,
+        'tier': threshold_samples if sample_count >= 10 else 0,
+    }
+
+
+# sandbox_validator.py 修改 _make_decision 方法
+
+def _make_decision(self, validation_result, sample_count):
+    """
+    根据验证结果和样本量做出决策
+    
+    修正：使用分级阈值而非固定阈值
+    
+    Returns:
+        'pass' | 'fail' | 'continue'
+    """
+    metrics = validation_result['metrics']
+    comparison = validation_result['comparison']
+    
+    win_rate = metrics['win_rate']
+    expectancy = metrics['expectancy']
+    improvement = comparison['improvement']
+    baseline_expectancy = comparison['baseline_expectancy']
+    
+    # 使用分级阈值
+    threshold_info = get_sample_adjusted_threshold(sample_count, baseline_expectancy)
+    required_expectancy = threshold_info['required_expectancy']
+    
+    # 通过条件：期望值 >= 分级阈值 + 胜率 >= 50 + 有提升
+    if (expectancy >= required_expectancy and
+        win_rate >= self.config['pass_win_rate_threshold'] and
+        improvement >= self.config['improvement_threshold']):
+        return 'pass', threshold_info
+    
+    # 失败条件
+    if (expectancy <= self.config['fail_expectancy_threshold'] or
+        win_rate <= self.config['fail_win_rate_threshold']):
+        return 'fail', threshold_info
+    
+    # 继续观察
+    return 'continue', threshold_info
+```
 ```
 
 ---
@@ -369,6 +457,24 @@ CREATE TABLE IF NOT EXISTS daily_monitor_log (
     created_at TEXT
 );
 ```
+
+### trading_day_cache（新增）
+
+缓存交易日检查结果，避免非交易日重复 API 调用：
+
+```sql
+CREATE TABLE IF NOT EXISTS trading_day_cache (
+    date TEXT PRIMARY KEY,           -- 检查的日期
+    is_trading_day INTEGER,          -- 0=非交易日, 1=交易日
+    checked_at TEXT,                 -- 检查时间
+    data_available INTEGER           -- 数据源是否有数据
+);
+```
+
+缓存策略：
+- 当天检查的，或检查时间在收盘后（≥17:00）→ 缓存有效
+- API多次失败或17:00前检查 → 不缓存（数据源可能未更新）
+- 非交易日首次检查后后续执行直接使用缓存
 
 ---
 
@@ -508,11 +614,13 @@ def apply_signal_weight_multiplier(signal_type, base_score, signal_status):
 ## 模块文件清单
 
 ```
-adaptive_engine.py      # 核心控制器（调度每日监控+每周优化）
+adaptive_engine.py      # 核心控制器（调度每日监控+每周优化 + 变更历史管理）
 daily_monitor.py        # 每日监控模块 + 环境感知
 weekly_optimizer.py     # 每周四层优化模块（参数OOS验证+期望值驱动）
 sandbox_validator.py    # 沙盒验证模块
-optimization_history.py # 变更历史+回滚模块
+normalizer.py           # 评分归一化模块（基于历史样本全局统计）
+signal_constants.py     # 信号类型常量定义（英文主键↔中文显示映射）
+strategy_config.py      # 参数中心（含DYNAMIC_PARAMS动态参数支持）
 ```
 
 ---
@@ -856,6 +964,7 @@ def rolling_sandbox_validate(sandbox_config, weeks_passed):
     
     每周运行一次，使用最近30天退出数据评估
     连续3周通过才正式应用
+    使用分级阈值（见 get_sample_adjusted_threshold 函数）
     """
     results = []
     
@@ -869,22 +978,32 @@ def rolling_sandbox_validate(sandbox_config, weeks_passed):
         sandbox_exp = calculate_expectancy(sandbox_exits)
         live_exp = calculate_expectancy(live_exits)
         
-        week_passed = sandbox_exp >= live_exp * get_threshold(len(sandbox_exits))
-        results.append(week_passed)
+        # 使用分级阈值（见本文档"沙盒验证机制"章节的 get_sample_adjusted_threshold 函数）
+        threshold_info = get_sample_adjusted_threshold(len(sandbox_exits), live_exp)
+        required_exp = threshold_info['required_expectancy']
+        
+        week_passed = sandbox_exp >= required_exp
+        results.append({
+            'week': week + 1,
+            'passed': week_passed,
+            'sandbox_exp': sandbox_exp,
+            'live_exp': live_exp,
+            'threshold_info': threshold_info,
+        })
     
     # 修正：检查最近N周是否全部通过（连续通过）
     min_weeks = SANDBOX_VALIDATION_CONFIG['min_weeks_to_confirm']
-    recent_results = results[-min_weeks:]
+    recent_results = [r['passed'] for r in results[-min_weeks:]]
     
     # all() 确保全部通过，才是"连续"
     consecutive_all_passed = all(recent_results) and len(recent_results) >= min_weeks
     
     if consecutive_all_passed:
-        return {'status': 'passed', 'weeks_evaluated': len(results)}
+        return {'status': 'passed', 'weeks_evaluated': len(results), 'details': results}
     elif len(results) < min_weeks:
-        return {'status': 'evaluating', 'weeks_passed': len(results)}
+        return {'status': 'evaluating', 'weeks_passed': len(results), 'details': results}
     else:
-        return {'status': 'failed', 'reason': '最近{}周未全部通过'.format(min_weeks)}
+        return {'status': 'failed', 'reason': '最近{}周未全部通过'.format(min_weeks), 'details': results}
 ```
 
 ---
@@ -1176,3 +1295,487 @@ ALTER TABLE optimization_history ADD COLUMN validation_started_at TEXT;
 |----------|----------|------|
 | sandbox_test_result注释缺applied | 补充四态注释 | 正文326行 |
 | normalize_scores与新版并存 | 标注旧版为[已废弃] | 正文406行 |
+
+---
+
+### B.14 归一化函数实现设计（新增）
+
+#### B.14.1 文件结构
+
+新增独立模块 `normalizer.py`：
+
+```
+shikong_fufei/
+├── normalizer.py          # 新增模块
+│   ├── get_history_stats()    # 获取历史统计（从pick_tracking查询）
+│   ├── normalize_scores()     # 归一化评分（选股时调用）
+│   └── ScoreNormalizer 类     # 封装逻辑，支持置信度标记
+```
+
+**设计决策**：
+- 选择方案A（独立模块）而非集成到 strategy_config 或 weekly_optimizer
+- 原因：归一化是核心计算逻辑，独立模块便于测试、避免循环依赖、daily_scanner和weekly_optimizer都需要调用
+
+---
+
+#### B.14.2 评分维度定义
+
+```python
+# normalizer.py
+
+SCORE_DIMENSIONS = [
+    'wave_gain',      # 波段涨幅评分（score_wave_gain）
+    'shallow_dd',     # 回调深度评分（score_shallow_dd）
+    'day_gain',       # 当日涨幅评分（score_day_gain）
+    'volume',         # 放量评分（score_volume）
+    'ma_bull',        # 多头排列评分（score_ma_bull）
+    'sector',         # 板块动量评分（score_sector）
+    'signal_bonus',   # 信号类型加分（score_signal_bonus）
+]
+
+# 注意：score_base 基础分不纳入权重调整范围，始终保持固定值5分
+```
+
+---
+
+#### B.14.3 ScoreNormalizer 类设计
+
+```python
+class ScoreNormalizer:
+    """评分归一化器：基于历史样本全局统计归一化
+    
+    设计目标：
+    1. 调整评分权重后，总分均值保持稳定（≈基准值）
+    2. 支持渐进置信度：样本不足时返回低置信标记
+    3. 实时查询历史样本，无需缓存机制
+    """
+    
+    MIN_SAMPLES = 30      # 最小样本阈值（低于此值返回低置信）
+    RECENT_WINDOW = 100   # 样本充足时使用最近100笔
+    
+    def __init__(self, db_path=None):
+        """初始化，连接数据层"""
+        if db_path is None:
+            self.dl = get_data_layer()
+        else:
+            from data_layer import StockDataLayer
+            self.dl = StockDataLayer(db_path)
+    
+    def get_history_stats(self):
+        """
+        获取历史评分统计（从 pick_tracking 实时查询）
+        
+        渐进升级机制：
+        - n < 30：全部样本，低置信度
+        - n >= 50：最近100笔，中等置信度
+        - n >= 30 且 n < 50：全部样本，中等置信度
+        
+        Returns:
+            stats: dict {'avg_wave_gain': 12.3, 'avg_shallow_dd': 8.7, ...}
+            meta: dict {'method': 'all'|'recent_100', 'confidence': 'low'|'medium'|'high', 'n': int}
+        """
+        with self.dl._get_conn() as conn:
+            exited_df = pd.read_sql(
+                "SELECT * FROM pick_tracking WHERE status='exited'",
+                conn
+            )
+        
+        n = len(exited_df)
+        
+        if n < self.MIN_SAMPLES:
+            # 样本不足：全部样本，低置信
+            stats = self._calculate_stats(exited_df)
+            return stats, {'method': 'all', 'confidence': 'low', 'n': n}
+        
+        elif n >= self.MIN_SAMPLES + self.RECENT_WINDOW:
+            # 样本充足：最近100笔，高置信
+            recent = exited_df.tail(self.RECENT_WINDOW)
+            stats = self._calculate_stats(recent)
+            return stats, {'method': 'recent_100', 'confidence': 'high', 'n': n}
+        
+        else:
+            # 样本中等：全部样本，中等置信
+            stats = self._calculate_stats(exited_df)
+            return stats, {'method': 'all', 'confidence': 'medium', 'n': n}
+    
+    def _calculate_stats(self, df):
+        """计算各评分维度的均值"""
+        stats = {}
+        for dim in SCORE_DIMENSIONS:
+            col_name = f'score_{dim}'
+            if col_name in df.columns and df[col_name].notna().sum() > 0:
+                stats[f'avg_{dim}'] = df[col_name].mean()
+            else:
+                stats[f'avg_{dim}'] = 10.0  # 默认值
+        return stats
+    
+    def normalize_scores(self, scores_dict, weights_dict):
+        """
+        归一化评分
+        
+        核心公式：
+        scale_factor = global_base_total / global_weighted_total
+        normalized_score = weighted_total * scale_factor
+        
+        其中：
+        - global_base_total = Σ history_avg[dim] （权重=1.0时的基准总分）
+        - global_weighted_total = Σ history_avg[dim] × current_weight[dim]
+        - weighted_total = Σ current_score[dim] × current_weight[dim]
+        
+        Args:
+            scores_dict: 当前股票各维度评分 {'wave_gain': 20, 'shallow_dd': 15, ...}
+            weights_dict: 当前权重 {'weight_wave_gain': 1.2, ...}
+        
+        Returns:
+            normalized_score: float 归一化后总分（不含score_base）
+            meta: dict {'method': ..., 'confidence': ..., 'n': ..., 'scale_factor': ...}
+        """
+        # 1. 获取历史统计
+        history_stats, meta = self.get_history_stats()
+        
+        # 2. 计算当前股票加权总分
+        weighted_total = sum(
+            scores_dict.get(dim, 0) * weights_dict.get(f'weight_{dim}', 1.0)
+            for dim in SCORE_DIMENSIONS
+        )
+        
+        # 3. 计算全局基准总分（权重=1.0）
+        global_base_total = sum(
+            history_stats.get(f'avg_{dim}', 10.0) for dim in SCORE_DIMENSIONS
+        )
+        
+        # 4. 计算全局加权总分（当前权重）
+        global_weighted_total = sum(
+            history_stats.get(f'avg_{dim}', 10.0) * weights_dict.get(f'weight_{dim}', 1.0)
+            for dim in SCORE_DIMENSIONS
+        )
+        
+        # 5. 缩放因子
+        scale_factor = global_base_total / global_weighted_total if global_weighted_total > 0 else 1.0
+        
+        # 6. 归一化得分
+        normalized_score = weighted_total * scale_factor
+        
+        # 7. 补充meta信息
+        meta['scale_factor'] = scale_factor
+        meta['weighted_total_raw'] = weighted_total
+        meta['global_base_total'] = global_base_total
+        meta['global_weighted_total'] = global_weighted_total
+        
+        return normalized_score, meta
+```
+
+---
+
+#### B.14.4 daily_scanner.py 集成修改
+
+在 `detect_pattern()` 或 `_scan_core()` 中调用归一化：
+
+```python
+# daily_scanner.py 修改示例
+
+from normalizer import ScoreNormalizer
+
+def detect_pattern(df):
+    # ... 原有评分计算逻辑 ...
+    
+    score_details = {
+        'wave_gain': score_wave_gain,
+        'shallow_dd': score_shallow_dd,
+        'day_gain': score_day_gain,
+        'volume': score_volume,
+        'ma_bull': score_ma_bull,
+        'sector': score_sector,        # 板块评分（新增）
+        'signal_bonus': score_signal_bonus,
+    }
+    
+    # 原代码：
+    # total_score = score_base + score_wave_gain + score_shallow_dd + ...
+    
+    # 新代码：使用归一化
+    normalizer = ScoreNormalizer()
+    cfg = StrategyConfig()
+    weights = cfg.get_weights()  # 获取当前权重
+    
+    normalized_score, meta = normalizer.normalize_scores(score_details, weights)
+    total_score = score_base + normalized_score
+    
+    return {
+        'sig': sig,
+        'score': total_score,
+        'score_normalized': normalized_score,
+        'score_raw': sum(score_details.values()),  # 原始总分（不含base）
+        'normalization_meta': meta,
+        'score_details': {'score_base': score_base, **{f'score_{k}': v for k, v in score_details.items()}},
+        # ... 其他字段 ...
+    }
+```
+
+**注意**：`score_base=5` 基础分不纳入归一化，单独相加。
+
+---
+
+#### B.14.5 weekly_optimizer.py 集成修改
+
+在 `_optimize_score_weights_layer()` 中检查置信度：
+
+```python
+# weekly_optimizer.py 修改示例
+
+from normalizer import ScoreNormalizer
+
+def _optimize_score_weights_layer(self, optimize_date):
+    """评分层优化：根据 score-pnl 相关性调整权重"""
+    
+    # 1. 检查历史统计置信度
+    normalizer = ScoreNormalizer()
+    history_stats, meta = normalizer.get_history_stats()
+    
+    if meta['confidence'] == 'low':
+        return {
+            'adjusted': False,
+            'reason': f'样本不足({meta["n"]}笔)，暂不调整权重',
+            'meta': meta,
+        }
+    
+    # 2. 继续原有优化逻辑...
+    correlations = self._compute_score_correlations()
+    
+    if correlations is None:
+        return {'adjusted': False, 'reason': 'insufficient_correlation_data'}
+    
+    # 3. 调整权重
+    current_weights = self.cfg.get_weights()
+    weight_changes = {}
+    
+    for weight_key in current_weights:
+        score_key = weight_key.replace('weight_', '')
+        if score_key in correlations:
+            correlation = correlations[score_key]
+            old_weight = current_weights[weight_key]
+            new_weight = adjust_score_weight(old_weight, correlation)
+            
+            if abs(new_weight - old_weight) > 0.01:
+                weight_changes[weight_key] = {
+                    'old': old_weight,
+                    'new': new_weight,
+                    'correlation': correlation,
+                }
+                self.cfg.set(weight_key, new_weight)
+    
+    # 4. 验证归一化效果（可选）
+    if weight_changes:
+        # 模拟一只"平均股票"，验证归一化后总分是否稳定
+        avg_scores = {dim: history_stats.get(f'avg_{dim}', 10) for dim in SCORE_DIMENSIONS}
+        new_weights = {k: v['new'] for k, v in weight_changes.items()}
+        updated_weights = {**current_weights, **new_weights}
+        
+        normalized_avg, _ = normalizer.normalize_scores(avg_scores, updated_weights)
+        # 验证：normalized_avg 应 ≈ global_base_total
+        
+    return {
+        'adjusted': len(weight_changes) > 0,
+        'weight_changes': weight_changes,
+        'correlations': correlations,
+        'history_meta': meta,
+    }
+```
+
+---
+
+#### B.14.6 输出格式示例
+
+选股结果中新增归一化相关字段：
+
+```json
+{
+  "代码": "002384",
+  "名称": "东山精密",
+  "评分": 48.5,
+  "score_normalized": 43.5,
+  "score_raw": 52.0,
+  "score_base": 5,
+  "normalization_meta": {
+    "method": "all",
+    "confidence": "low",
+    "n": 6,
+    "scale_factor": 0.92,
+    "weighted_total_raw": 52.0,
+    "global_base_total": 70.0,
+    "global_weighted_total": 75.4
+  },
+  "score_details": {
+    "score_base": 5,
+    "score_wave_gain": 20,
+    "score_shallow_dd": 15,
+    "score_day_gain": 10,
+    "score_volume": 5,
+    "score_ma_bull": 10,
+    "score_sector": 0,
+    "score_signal_bonus": 2
+  }
+}
+```
+
+---
+
+#### B.14.7 单元测试设计
+
+```python
+# tests/test_normalizer.py
+
+import pytest
+from normalizer import ScoreNormalizer, SCORE_DIMENSIONS
+
+class TestScoreNormalizer:
+    
+    def test_empty_samples_returns_low_confidence(self):
+        """样本为空时返回低置信度"""
+        normalizer = ScoreNormalizer(db_path=':memory:')
+        stats, meta = normalizer.get_history_stats()
+        assert meta['confidence'] == 'low'
+        assert meta['n'] == 0
+    
+    def test_normalize_with_default_weights(self):
+        """权重全为1.0时，归一化因子应为1.0"""
+        scores = {'wave_gain': 20, 'shallow_dd': 15, ...}
+        weights = {f'weight_{dim}': 1.0 for dim in SCORE_DIMENSIONS}
+        normalizer = ScoreNormalizer(db_path=':memory:')
+        
+        normalized, meta = normalizer.normalize_scores(scores, weights)
+        # 当权重=1.0时，scale_factor=global_base/global_base=1.0
+        assert meta['scale_factor'] == 1.0
+        assert normalized == sum(scores.values())
+    
+    def test_normalize_with_increased_weight(self):
+        """增加某维度权重后，归一化应降低缩放因子"""
+        scores = {'wave_gain': 20, 'shallow_dd': 15, ...}
+        weights_increased = {'weight_wave_gain': 1.5, **{f'weight_{dim}': 1.0 for dim in SCORE_DIMENSIONS if dim != 'wave_gain'}}
+        
+        normalizer = ScoreNormalizer(db_path=':memory:')
+        normalized_default, meta_default = normalizer.normalize_scores(scores, {f'weight_{dim}': 1.0 for dim in SCORE_DIMENSIONS})
+        normalized_increased, meta_increased = normalizer.normalize_scores(scores, weights_increased)
+        
+        # 增加权重后，缩放因子应降低（保持总分稳定）
+        assert meta_increased['scale_factor'] < meta_default['scale_factor']
+    
+    def test_base_score_not_normalized(self):
+        """基础分不纳入归一化"""
+        score_base = 5
+        scores = {'wave_gain': 20, ...}
+        weights = {f'weight_{dim}': 1.0 for dim in SCORE_DIMENSIONS}
+        
+        normalizer = ScoreNormalizer(db_path=':memory:')
+        normalized, _ = normalizer.normalize_scores(scores, weights)
+        
+        # 最终总分 = base + normalized
+        total = score_base + normalized
+        assert total != normalized  # base分单独加
+```
+
+---
+
+#### B.14.8 风险与缓解
+
+| 风险 | 缓解措施 |
+|------|----------|
+| 样本不足导致归一化不稳定 | 返回低置信标记，weekly_optimizer 检查后跳过权重调整 |
+| 查询 pick_tracking 性能问题 | 每次选股仅查询一次，样本积累后可考虑缓存 |
+| score_* 字段缺失（旧数据） | `_calculate_stats()` 使用默认值10填充 |
+| 权重调整过度导致 scale_factor 过小/过大 | 在 adjust_score_weight() 中限制权重范围 [0.7, 1.5] |
+
+---
+
+#### B.14.9 修订汇总（第五轮）
+
+| 评审问题 | 解决方案 | 章节 |
+|----------|----------|------|
+| 归一化函数缺少实现设计 | 新增 B.14 独立模块设计 | 本节 |
+| 历史样本来源未明确 | 实时查询 pick_tracking（选项A） | B.14.3 |
+| 样本筛选范围未定义 | 渐进升级机制（全部→最近100笔） | B.14.3 |
+| daily_scanner 集成点未说明 | 修改 detect_pattern() | B.14.4 |
+| weekly_optimizer 置信度检查缺失 | 新增置信度检查逻辑 | B.14.5 |
+
+---
+
+### B.15 交易日缓存机制（新增）
+
+**问题：** 非交易日多次执行 --scan 时，is_all_updated() 会重复调用 baostock API 检查目标日期是否有数据，浪费时间。
+
+**解决方案：** 新增 trading_day_cache 表缓存检查结果：
+
+```python
+# data_layer.py 新增缓存检查逻辑
+
+def is_all_updated(self, target_date=None):
+    """
+    检查是否所有股票的数据都已更新到目标日期
+    
+    修正：先检查缓存，避免重复 API 调用
+    """
+    # ... 原有逻辑 ...
+    
+    # 先检查缓存
+    cached = conn.execute("""
+        SELECT is_trading_day, data_available, checked_at
+        FROM trading_day_cache WHERE date=?
+    """, (target_date,)).fetchone()
+    
+    if cached:
+        is_trading_day = cached[0]
+        data_available = cached[1]
+        checked_at = cached[2]
+        # 缓存有效条件：当天检查的，或检查时间在收盘后（≥17:00）
+        checked_dt = datetime.strptime(checked_at, '%Y-%m-%d %H:%M:%S')
+        is_same_day = checked_dt.strftime('%Y-%m-%d') == datetime.now().strftime('%Y-%m-%d')
+        is_checked_after_close = checked_dt.hour >= 17
+        
+        if is_same_day or is_checked_after_close:
+            if is_trading_day == 0:
+                return True, max_date, {'reason': 'non_trading_day', 'cached': True}
+            elif data_available == 1:
+                return False, max_date, {'reason': 'need_update', 'cached': True}
+            else:
+                return False, max_date, {'reason': 'data_not_updated', 'cached': True}
+    
+    # 无缓存或缓存过期 → 执行 API 检查
+    # ... 原有 API 检查逻辑 ...
+    
+    # 检查完成后缓存结果
+    if has_target_data or index_has_data:
+        self._cache_trading_day(target_date, is_trading_day=True, data_available=True)
+    elif not is_early_after_close and api_error_count < 3:
+        self._cache_trading_day(target_date, is_trading_day=False, data_available=False)
+
+
+def _cache_trading_day(self, date, is_trading_day, data_available):
+    """缓存交易日检查结果"""
+    with self._get_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO trading_day_cache
+            (date, is_trading_day, checked_at, data_available)
+            VALUES (?, ?, datetime('now'), ?)
+        """, (date, 1 if is_trading_day else 0, 1 if data_available else 0))
+```
+
+**缓存策略说明：**
+
+| 检查结果 | 是否缓存 | 原因 |
+|----------|----------|------|
+| 非交易日（17:00后确认） | ✓ 缓存 | 确定的非交易日，可直接使用 |
+| 交易日数据可用 | ✓ 缓存 | 数据源已更新，后续可增量 |
+| 17:00前检查 | ✗ 不缓存 | 数据源可能未更新 |
+| API多次失败 | ✗ 不缓存 | 数据源可能不可用 |
+
+---
+
+### B.16 修订汇总（第六轮）
+
+| 评审问题 | 解决方案 | 章节 |
+|----------|----------|------|
+| 模块清单错误（optimization_history.py） | 合并到 adaptive_engine.py，新增 normalizer.py | 正文508-516行 |
+| 冷启动样本阈值不一致（5笔 vs 10笔） | 统一为10笔 | 正文145行 |
+| 分级阈值缺少实现代码 | 新增 get_sample_adjusted_threshold() | 正文258-267行后 |
+| 沙盒验证缺少trading_day_cache表 | 新增表定义和缓存策略 | 正文447-459行后 |
+| 滚动验证缺少分级阈值集成 | 新增 threshold_info 调用 | B.6 |
+| 架构图遗漏 normalizer 模块 | 新增归一化模块和 trading_day_cache 表 | 正文18-51行 |
