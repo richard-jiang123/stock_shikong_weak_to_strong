@@ -17,7 +17,7 @@ from normalizer import ScoreNormalizer, SCORE_DIMENSIONS
 from change_manager import ChangeManager
 
 
-def adjust_score_weight(current_weight, correlation, base_weight=1.0):
+def adjust_score_weight(current_weight, correlation, base_weight=1.0, momentum=0.3, history=None):
     """
     根据评分-盈亏相关性动态调整权重
 
@@ -25,12 +25,15 @@ def adjust_score_weight(current_weight, correlation, base_weight=1.0):
         current_weight: 当前权重值
         correlation: Spearman相关系数（score vs final_pnl）
         base_weight: 基准权重（默认1.0），用于回归锚点
+        momentum: 动量参数（保留接口兼容性，当前实现未使用）
+        history: 历史权重列表（保留接口兼容性，当前实现未使用）
 
     Returns:
         新权重值（调整幅度限制在 ±20%）
     """
     # 调整幅度限制
     MAX_ADJUSTMENT = 0.20
+    MIN_DEVIATION = 0.05  # 最小偏离保护
 
     if correlation > 0.3:
         # 强正相关 → 加权（最多增加20%）
@@ -41,12 +44,14 @@ def adjust_score_weight(current_weight, correlation, base_weight=1.0):
         adjustment = min(MAX_ADJUSTMENT, abs(correlation) * 0.5)
         new_weight = current_weight * (1 - adjustment)
     else:
-        # 弱相关 → 回归锚点（向 base_weight 靠拢）
+        # 弱相关 → 动量机制减缓回归速度
         delta = current_weight - base_weight
-        if abs(delta) > 0.01:
-            # 每次回归 10% 的偏差
-            new_weight = current_weight - delta * 0.1
+        if abs(delta) > MIN_DEVIATION:
+            # 动量机制：减缓回归速度
+            regression_factor = 0.05
+            new_weight = current_weight - delta * regression_factor
         else:
+            # 偏离不足 MIN_DEVIATION，保持当前权重
             new_weight = current_weight
 
     return new_weight
@@ -79,7 +84,7 @@ class WeeklyOptimizer:
             'description': '环境层：调整市场环境系数',
             'method': 'regime_based',
             'frequency': 'weekly',
-            'requires_sandbox': False,  # 环境系数直接应用
+            'requires_sandbox': True,  # 环境参数走沙盒流程
         },
     }
 
@@ -179,6 +184,18 @@ class WeeklyOptimizer:
                     batch_id=batch_id,
                     current_value=change['old']
                 )
+            # 暂存 activity_coefficient（从 market_regime 获取）
+            if results['environment'].get('activity_coefficient') is not None:
+                current_coeff = self.cfg.get('activity_coefficient')
+                new_coeff = results['environment']['activity_coefficient']
+                if abs(new_coeff - current_coeff) > 0.01:
+                    self.change_mgr.stage_change(
+                        optimize_type='strategy_config',
+                        param_key='activity_coefficient',
+                        new_value=new_coeff,
+                        batch_id=batch_id,
+                        current_value=current_coeff
+                    )
 
         # 记录优化历史
         self._record_optimization_history(results, optimize_date)
@@ -318,9 +335,7 @@ class WeeklyOptimizer:
                     'history_meta': meta,
                 }
 
-            # 应用权重变更
-            for weight_key, change in weight_changes.items():
-                self.cfg.set(weight_key, change['new'])
+            # 权重变更已通过 stage_change() 暂存到 sandbox_config
 
         return {
             'adjusted': len(weight_changes) > 0,
@@ -453,15 +468,6 @@ class WeeklyOptimizer:
                     'action': action,
                 }
 
-                # 更新数据库状态
-                weight_mult = get_weight_multiplier(new_status)
-                with self.dl._get_conn() as conn:
-                    conn.execute("""
-                        UPDATE signal_status SET
-                            status_level=?, weight_multiplier=?, last_check_date=?
-                        WHERE signal_type=?
-                    """, (new_status, weight_mult, optimize_date, signal_type))
-
             expectancy_metrics[signal_type] = {
                 'sample_count': sample_count,
                 'win_rate': win_rate,
@@ -508,7 +514,6 @@ class WeeklyOptimizer:
                     'old': current_coeff,
                     'new': new_coeff,
                 }
-                self.cfg.set('bull_threshold', new_coeff)
 
         elif regime_type == 'bear':
             # 退潮期：降低活跃度系数
@@ -520,10 +525,8 @@ class WeeklyOptimizer:
                     'old': current_coeff,
                     'new': new_coeff,
                 }
-                self.cfg.set('bear_threshold', new_coeff)
 
-        # 更新当前活跃度系数
-        self.cfg.set('activity_coefficient', regime_data['activity_coefficient'])
+        # activity_coefficient 由 regime 数据提供，已通过返回值传递
 
         return {
             'adjusted': len(threshold_updates) > 0,

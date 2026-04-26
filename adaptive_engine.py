@@ -100,6 +100,14 @@ class AdaptiveEngine:
         """
         运行每周优化
 
+        完整沙盒流程：
+        1. 执行四层优化（变更暂存到 sandbox_config）
+        2. 执行沙盒验证（sandbox_validator.validate_batch）
+        3. 应用通过验证的变更（sandbox_validator.apply_passed_changes）
+           - apply_passed_changes 内部调用 commit_change
+           - commit_change 写入 strategy_config / signal_status（生产参数）
+           - 标记 sandbox_config.status = 'applied'
+
         Args:
             optimize_date: 优化日期，默认今天
             layers: 要优化的层列表
@@ -148,23 +156,24 @@ class AdaptiveEngine:
                 'reason': 'pending_validation_in_progress',
             }
 
-        # 执行四层优化
+        # 1. 执行四层优化（变更暂存到 sandbox_config）
         optimization_results = self.weekly_optimizer.run(optimize_date, layers)
+        batch_id = optimization_results.get('batch_id')
 
-        # 执行沙盒验证
-        sandbox_validation = self.sandbox_validator.validate_optimization()
+        # 2. 执行沙盒验证（使用 batch_id）
+        sandbox_validation = self.sandbox_validator.validate_batch(batch_id)
 
-        # 应用通过的优化
-        applied = 0
-        rejected = 0
+        # 3. 应用通过验证的变更（内部调用 commit_change）
+        # apply_passed_changes 流程：
+        #   for item in passed_items:
+        #       self.change_mgr.commit_change(item['id'])
+        #           -> 写入 strategy_config / signal_status（生产参数）
+        #           -> 标记 sandbox_config.status = 'applied'
+        applied_result = self.sandbox_validator.apply_passed_changes(batch_id)
 
-        if isinstance(sandbox_validation, dict) and sandbox_validation.get('details'):
-            for detail in sandbox_validation['details']:
-                if detail.get('status') == 'passed':
-                    self._apply_optimization(detail)
-                    applied += 1
-                elif detail.get('status') == 'failed':
-                    rejected += 1
+        # 统计结果
+        applied = applied_result.get('applied', 0)
+        rejected = sandbox_validation.get('failed', 0)
 
         return {
             'optimization_results': optimization_results,
@@ -188,31 +197,42 @@ class AdaptiveEngine:
         detail = alert['detail']
 
         if alert_type == 'signal_expectancy_low':
-            # 信号期望值过低 → 考虑禁用
+            # 信号期望值过低 -> 考虑禁用
             return self._handle_signal_critical(alert, monitor_date)
 
         elif alert_type == 'market_bear':
-            # 市场退潮期 → 降低活跃度系数
+            # 市场退潮期 -> 降低活跃度系数
             return self._handle_market_critical(alert, monitor_date)
 
         else:
-            # 其他类型 → 仅记录
+            # 其他类型 -> 仅记录
             self._log_critical(alert, monitor_date)
             return True
 
     def _handle_signal_critical(self, alert, monitor_date):
         """
-        处理信号期望值 critical 预警
+        处理信号期望值 critical 预警（通过沙盒流程）
 
-        策略：自动禁用期望值过低的信号类型
+        流程：生成批次ID -> 保存快照 -> 暂存变更 -> 紧急应用
         """
         from signal_constants import SIGNAL_TYPE_MAPPING, get_weight_multiplier
         from daily_monitor import wilson_expectancy_lower_bound
         import numpy as np
 
-        # 解析信号类型
-        detail = alert['detail']
+        handled = False
 
+        # 1. 生成紧急批次 ID
+        date_str = monitor_date.replace('-', '') + '-crit'
+        batch_id = self.change_mgr.generate_batch_id(date_str)
+
+        # 2. 保存快照（变更前状态）
+        self.change_mgr.save_snapshot(
+            trigger_reason='signal_critical',
+            batch_id=batch_id,
+            snapshot_type='pre_change'
+        )
+
+        # 3. 遍历信号类型，检查期望值下界
         for signal_type in SIGNAL_TYPE_MAPPING.keys():
             display_name = SIGNAL_TYPE_MAPPING[signal_type]
 
@@ -234,54 +254,90 @@ class AdaptiveEngine:
             expectancy_lb = wilson_expectancy_lower_bound(win_rate, avg_win, avg_loss, sample_count)
 
             if expectancy_lb < self.CRITICAL_CONFIG['auto_disable_threshold']:
-                # 自动禁用信号
+                # 3a. 获取当前状态
                 with self.dl._get_conn() as conn:
-                    conn.execute("""
-                        UPDATE signal_status SET
-                            status_level='disabled',
-                            weight_multiplier=0.0,
-                            disable_reason=?,
-                            last_check_date=?
-                        WHERE signal_type=?
-                    """, (f'auto_disabled_expectancy_{expectancy_lb:.2%}', monitor_date, signal_type))
+                    current_status = conn.execute("""
+                        SELECT status_level FROM signal_status WHERE signal_type=?
+                    """, (signal_type,)).fetchone()
+                    current_status = current_status[0] if current_status else 'active'
 
-                # 记录到优化历史
+                # 3b. 暂存变更到 sandbox_config（不直接写库）
+                self.change_mgr.stage_change(
+                    optimize_type='signal_status',
+                    param_key=signal_type,
+                    new_value='disabled',
+                    batch_id=batch_id,
+                    current_value=current_status
+                )
+
+                # 3c. 记录到优化历史
                 with self.dl._get_conn() as conn:
                     conn.execute("""
                         INSERT INTO optimization_history
                         (optimize_date, optimize_type, param_key, old_value, new_value,
-                         sandbox_test_result, created_at)
-                        VALUES (?, 'signal_critical', ?, ?, ?, 'applied', datetime('now'))
-                    """, (monitor_date, signal_type, 'active', 'disabled'))
+                         batch_id, trigger_reason, sandbox_test_result, created_at)
+                        VALUES (?, 'signal_critical', ?, ?, ?, ?, 'auto_disable_expectancy', 'pending', datetime('now'))
+                    """, (monitor_date, signal_type, current_status, 'disabled', batch_id))
 
-                self._notify_critical(f"信号 {signal_type} 已自动禁用（期望值下界 {expectancy_lb:.2%}）")
-                return True
+                handled = True
 
-        return False
+        # 4. 紧急应用（绕过 3 周验证）
+        if handled:
+            result = self.sandbox_validator.emergency_apply_changes(batch_id)
+            self._notify_critical(
+                f"信号 critical 预警处理: {result['applied']} 项变更已紧急应用 (批次 {batch_id})"
+            )
+
+        return handled
 
     def _handle_market_critical(self, alert, monitor_date):
         """
-        处理市场环境 critical 预警
+        处理市场环境 critical 预警（通过沙盒流程）
 
-        筙略：降低活跃度系数
+        流程：生成批次ID -> 保存快照 -> 暂存变更 -> 紧急应用
         """
-        # 获取当前活跃度系数
+        # 1. 生成紧急批次 ID
+        date_str = monitor_date.replace('-', '')
+        batch_id = self.change_mgr.generate_batch_id(date_str)
+
+        # 2. 保存快照（变更前状态）
+        self.change_mgr.save_snapshot(
+            trigger_reason='market_critical',
+            batch_id=batch_id,
+            snapshot_type='pre_change'
+        )
+
+        # 3. 获取当前值并计算新值
         current_coeff = self.cfg.get('activity_coefficient')
-
-        # 降低 20%
         new_coeff = max(0.2, current_coeff * 0.8)
-        self.cfg.set('activity_coefficient', new_coeff)
 
-        # 记录到优化历史
+        # 4. 暂存变更（不直接写库）
+        self.change_mgr.stage_change(
+            optimize_type='strategy_config',
+            param_key='activity_coefficient',
+            new_value=new_coeff,
+            batch_id=batch_id,
+            current_value=current_coeff
+        )
+
+        # 5. 记录到优化历史（状态为 pending，由 emergency_apply 更新）
         with self.dl._get_conn() as conn:
             conn.execute("""
                 INSERT INTO optimization_history
                 (optimize_date, optimize_type, param_key, old_value, new_value,
-                 sandbox_test_result, created_at)
-                VALUES (?, 'market_critical', ?, ?, ?, 'applied', datetime('now'))
-            """, (monitor_date, 'activity_coefficient', current_coeff, new_coeff))
+                 batch_id, trigger_reason, sandbox_test_result, created_at)
+                VALUES (?, 'market_critical', ?, ?, ?, ?, 'activity_coefficient_reduce', 'pending', datetime('now'))
+            """, (monitor_date, 'activity_coefficient', current_coeff, new_coeff, batch_id))
 
-        self._notify_critical(f"市场退潮期，活跃度系数已降低: {current_coeff:.2f} -> {new_coeff:.2f}")
+        # 6. 紧急应用（绕过 3 周验证窗口）
+        result = self.sandbox_validator.emergency_apply_changes(batch_id)
+
+        # 7. 通知处理结果
+        self._notify_critical(
+            f"市场 critical 预警处理: 活跃度系数 {current_coeff:.2f} -> {new_coeff:.2f} "
+            f"(批次 {batch_id}, 紧急应用 {result['applied']} 项)"
+        )
+
         return True
 
     def _log_critical(self, alert, monitor_date):

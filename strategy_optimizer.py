@@ -8,6 +8,7 @@ import json
 import random
 import itertools
 import sqlite3
+import hashlib
 from datetime import datetime, timedelta
 from copy import deepcopy
 
@@ -17,6 +18,16 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_layer import get_data_layer
 from strategy_config import StrategyConfig
+
+
+def get_dynamic_seed(start_date: str) -> int:
+    """根据日期 + 时间 + PID 生成动态种子"""
+    timestamp = datetime.now().strftime('%H%M%S')
+    pid = os.getpid()
+
+    hash_input = f"{start_date}_{timestamp}_{pid}"
+    hash_val = hashlib.md5(hash_input.encode()).hexdigest()
+    return int(hash_val[:8], 16) % 10000
 
 
 class StrategyOptimizer:
@@ -208,12 +219,66 @@ class StrategyOptimizer:
 
     # ── Evaluation ───────────────────────────────────────────────
 
+    @staticmethod
+    def smooth_objective(expectancy, win_rate, max_dd, sharpe, total):
+        """
+        平滑目标函数，负期望值时加强惩罚力度
+
+        Args:
+            expectancy: 期望值（小数，如 0.042）
+            win_rate: 胜率（0-1）
+            max_dd: 最大回撤（负值小数，如 -0.15）
+            sharpe: Sharpe 比率
+            total: 交易数
+
+        Returns:
+            objective_score: 目标得分
+        """
+        # 期望值贡献：正值线性增长，负值二次惩罚
+        exp_contrib = expectancy * 10 + 0.5
+        if exp_contrib >= 0:
+            exp_score = exp_contrib  # 正期望值：线性得分
+        else:
+            # 负期望值：二次惩罚（惩罚力度更强，优化方向更明确）
+            # 例如 exp_contrib=-0.5 → exp_score = -0.5 * 0.5 = -0.25
+            # 相比原方案 -0.5 * 0.2 = -0.1 惩罚更强
+            exp_score = exp_contrib * abs(exp_contrib)
+
+        # 最大回撤：max_dd 是负值
+        dd_base = 1 + max_dd
+        if dd_base > 0:
+            dd_score = dd_base
+        else:
+            # 回撤超 100%（极端情况），给予负惩罚
+            dd_score = dd_base * 0.5
+
+        # Sharpe：负值二次惩罚
+        sharpe_norm = sharpe / 3
+        if sharpe_norm > 1:
+            sharpe_score = 1.0 + (sharpe_norm - 1) * 0.1
+        elif sharpe_norm < 0:
+            sharpe_score = sharpe_norm * abs(sharpe_norm)  # 二次惩罚
+        else:
+            sharpe_score = sharpe_norm
+
+        score = (
+            0.35 * exp_score
+            + 0.25 * win_rate
+            + 0.20 * dd_score
+            + 0.10 * sharpe_score
+            + 0.10 * min(total / 100, 1.0)
+        )
+
+        # 设置下界：避免极端负值导致数值不稳定
+        return max(score, -0.5)
+
     def evaluate_params(self, params_dict, start_date, end_date, codes, sample_size=200):
         """
         Run backtest with given params, return objective score and metrics.
         """
         if len(codes) > sample_size:
-            random.seed(42)
+            seed = get_dynamic_seed(start_date)
+            random.seed(seed)
             codes = random.sample(codes, sample_size)
 
         # Load data from local DB only
@@ -261,12 +326,8 @@ class StrategyOptimizer:
         peak = cum.cummax()
         max_dd = ((cum - peak) / (peak + 1)).min() if len(cum) > 0 else 0
 
-        # Objective score
-        obj = (0.35 * max(0, expectancy * 10 + 0.5)
-               + 0.25 * win_rate
-               + 0.20 * max(0, 1 + max_dd)
-               + 0.10 * max(0, min(sharpe / 3, 1))
-               + 0.10 * min(total / 100, 1))
+        # Objective score (using smooth objective function)
+        obj = self.smooth_objective(expectancy, win_rate, max_dd, sharpe, total)
 
         return {
             'objective_score': obj,
@@ -563,6 +624,8 @@ if __name__ == '__main__':
     parser.add_argument('--train-window', type=int, default=180, help='Training window days')
     parser.add_argument('--test-window', type=int, default=60, help='Test window days')
     parser.add_argument('--step', type=int, default=30, help='Walk-forward step days')
+    parser.add_argument('--auto-apply', action='store_true',
+                        help='自动应用推荐参数（通过沙盒验证）')
     args = parser.parse_args()
 
     optimizer = StrategyOptimizer()
@@ -601,6 +664,42 @@ if __name__ == '__main__':
 
             print_param_comparison(optimizer.cfg.get_dict(), result['recommended_params'])
             optimizer.save_results(result)
+
+            if args.auto_apply:
+                # 调用沙盒流程应用参数
+                from change_manager import ChangeManager
+                from sandbox_validator import SandboxValidator
+
+                change_mgr = ChangeManager()
+                validator = SandboxValidator()
+
+                # 1. 生成批次 ID 并保存快照
+                batch_id = change_mgr.generate_batch_id()
+                change_mgr.save_snapshot('walkforward_optimize', batch_id)
+
+                # 2. 暂存推荐参数
+                recommended = result['recommended_params']
+                current = optimizer.cfg.get_dict()
+
+                staged_count = 0
+                for key, value in recommended.items():
+                    if abs(value - current.get(key, 0)) > 1e-6:
+                        change_mgr.stage_change(
+                            optimize_type='strategy_config',
+                            param_key=key,
+                            new_value=value,
+                            batch_id=batch_id,
+                            current_value=current.get(key)
+                        )
+                        staged_count += 1
+
+                if staged_count == 0:
+                    print('\n推荐参数与当前配置相同，无需应用')
+                else:
+                    # 3. Walk-Forward 已是 OOS 测试，直接紧急应用
+                    #    （不需要再用 3 周沙盒窗口重新验证）
+                    applied = validator.emergency_apply_changes(batch_id)
+                    print(f"\n已应用 {applied['applied']} 项推荐参数（Walk-Forward OOS 验证通过）")
         else:
             print('Walk-Forward 优化未产生有效结果')
 

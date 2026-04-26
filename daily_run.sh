@@ -26,7 +26,7 @@ cd "$SCRIPT_DIR"
 TODAY=$(date '+%Y-%m-%d')
 LOGFILE="${SCRIPT_DIR}/daily_run.log"
 LOOKBACK=90
-OPT_ROUNDS=3
+OPT_ROUNDS=10  # 从 3 增加到 10 轮
 OPT_SAMPLE=200
 TRAIN_WINDOW=180
 TEST_WINDOW=60
@@ -67,7 +67,81 @@ log() {
     echo "$line" | tee -a "$LOGFILE"
 }
 
+# 锁获取函数
+acquire_lock() {
+    local lock_name="$1"
+    local timeout="${2:-60}"
+
+    # 启动锁子进程（不重定向 stdin）
+    python3 "${SCRIPT_DIR}/process_lock.py" --acquire "${lock_name}" --timeout "${timeout}" &
+    LOCK_PID=$!
+
+    # 等待子进程启动并检查存活
+    sleep 1
+
+    # 用 kill -0 检查进程存活（不发信号，只检查）
+    if ! kill -0 "$LOCK_PID" 2>/dev/null; then
+        # 进程已退出，等待获取退出码
+        wait "$LOCK_PID" 2>/dev/null
+        local exit_code=$?
+        if [ $exit_code -eq 1 ]; then
+            log "  ✗ 获取锁超时，可能有其他实例正在运行"
+        else
+            log "  ✗ 锁进程异常退出 (exit=${exit_code})"
+        fi
+        end_run "fail"
+        exit 1
+    fi
+
+    log "  锁已获取 (PID=${LOCK_PID})"
+}
+
+# 锁释放函数（带 guard、进程检查和文件清理）
+release_lock() {
+    if [ -n "${LOCK_PID:-}" ]; then
+        if ps -p "${LOCK_PID}" > /dev/null 2>&1; then
+            kill "${LOCK_PID}" 2>/dev/null
+            wait "${LOCK_PID}" 2>/dev/null
+        fi
+        # 先尝试 Python 清理，失败则直接删除残留文件
+        python3 "${SCRIPT_DIR}/process_lock.py" --release daily_run 2>/dev/null || \
+            rm -f "${SCRIPT_DIR}/.locks/daily_run.lock" 2>/dev/null
+        unset LOCK_PID  # 防止重复释放
+    fi
+}
+
+# 错误处理函数：捕获错误并记录到 daily_monitor_log
+handle_error() {
+    local exit_code=$1
+    local command_name="${2:-unknown}"
+    local error_line="${3:-unknown}"
+
+    log "  ✗ 错误: ${command_name} 失败 (exit=${exit_code}, line=${error_line})"
+
+    # 写入 daily_monitor_log
+    python3 -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}')
+from data_layer import get_data_layer
+dl = get_data_layer()
+with dl._get_conn() as conn:
+    conn.execute('''
+        INSERT INTO daily_monitor_log
+        (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
+        VALUES (?, 'cron_failure', ?, 'critical', 'script_exit', datetime('now'))
+    ''', ('${TODAY}', 'command=${command_name} exit_code=${exit_code} line=${error_line}'))
+" 2>/dev/null
+
+    # 释放锁（带 guard）
+    release_lock
+
+    end_run "fail"
+    exit ${exit_code}
+}
+
 start_run() {
+    acquire_lock "daily_run" 60
+
     START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     START_SECONDS=$(date '+%s')
     echo "" >> "$LOGFILE"
@@ -84,20 +158,35 @@ start_run() {
 end_run() {
     local status=$1
     local end_seconds=$(date '+%s')
-    local elapsed=$((end_seconds - START_SECONDS))
-    local hours=$((elapsed / 3600))
-    local minutes=$((elapsed % 3600 / 60))
-    local seconds=$((elapsed % 60))
-    log "═══════════════════════════════════════════════════════"
-    if [ "$status" = "ok" ]; then
-        log "  执行完成: 成功"
+
+    # Guard：START_SECONDS 可能未定义（acquire_lock 失败时）
+    if [ -n "${START_SECONDS:-}" ]; then
+        local elapsed=$((end_seconds - START_SECONDS))
+        local hours=$((elapsed / 3600))
+        local minutes=$((elapsed % 3600 / 60))
+        local seconds=$((elapsed % 60))
+        log "═══════════════════════════════════════════════════════"
+        if [ "$status" = "ok" ]; then
+            log "  执行完成: 成功"
+        else
+            log "  执行完成: 失败"
+        fi
+        log "  结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        log "  运行耗时: ${hours}小时${minutes}分钟${seconds}秒"
     else
-        log "  执行完成: 失败"
+        log "═══════════════════════════════════════════════════════"
+        if [ "$status" = "ok" ]; then
+            log "  执行完成: 成功"
+        else
+            log "  执行完成: 失败"
+        fi
+        log "  结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        log "  运行耗时: 未知（锁获取阶段失败）"
     fi
-    log "  结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
-    log "  运行耗时: ${hours}小时${minutes}分钟${seconds}秒"
     log "═══════════════════════════════════════════════════════"
     echo "" >> "$LOGFILE"
+
+    release_lock
 }
 
 print_summary() {
@@ -518,6 +607,9 @@ run_rollback_monitor() {
 }
 
 # ── Main ──
+# 设置错误陷阱
+trap 'handle_error $? "${BASH_COMMAND}" ${LINENO}' ERR
+
 start_run
 
 CMD="${1:-all}"

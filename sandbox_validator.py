@@ -288,6 +288,51 @@ class SandboxValidator:
 
         return {'applied': applied}
 
+    def emergency_apply_changes(self, batch_id: str) -> dict:
+        """
+        紧急应用（绕过验证，直接 commit 所有 staged 变更）
+
+        用于 critical 预警等紧急场景，不等待 3 周验证窗口。
+
+        Args:
+            batch_id: 批次ID
+
+        Returns:
+            dict: {'applied': int, 'details': list, 'reason': 'emergency_bypass_validation'}
+        """
+        staged = self.change_mgr.get_staged_params(batch_id)
+        applied = 0
+        details = []
+
+        for item in staged:
+            # 强制标记为 passed
+            self.change_mgr.update_status(item['id'], 'passed')
+
+            # 直接 commit（写入生产参数）
+            if self.change_mgr.commit_change(item['id']):
+                applied += 1
+                details.append({
+                    'param_key': item['param_key'],
+                    'old_value': item['current_value'],
+                    'new_value': item['sandbox_value'],
+                    'status': 'emergency_applied',
+                })
+
+        # 批量更新 optimization_history（循环外一次性执行）
+        if applied > 0:
+            with self.dl._get_conn() as conn:
+                conn.execute("""
+                    UPDATE optimization_history
+                    SET sandbox_test_result='emergency_applied'
+                    WHERE batch_id=? AND sandbox_test_result='pending'
+                """, (batch_id,))
+
+        return {
+            'applied': applied,
+            'details': details,
+            'reason': 'emergency_bypass_validation',
+        }
+
     def _batch_validate_pending(self):
         """批量验证所有待验证记录"""
         with self.dl._get_conn() as conn:

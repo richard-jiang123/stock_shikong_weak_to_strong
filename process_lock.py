@@ -132,18 +132,48 @@ def get_lock_info(lock_name):
 
 
 if __name__ == '__main__':
-    # 测试锁机制
-    print("测试文件锁...")
+    import argparse
+    import sys
 
-    lock_name = 'test_lock'
+    parser = argparse.ArgumentParser(description='进程锁管理')
+    parser.add_argument('--acquire', metavar='NAME', help='获取锁')
+    parser.add_argument('--release', metavar='NAME', help='释放锁')
+    parser.add_argument('--timeout', type=int, default=30, help='等待超时秒数')
+    parser.add_argument('--status', metavar='NAME', help='检查锁状态')
+    args = parser.parse_args()
 
-    # 测试1: 正常获取锁
-    with file_lock(lock_name, timeout=5):
-        print(f"获取锁 '{lock_name}' 成功")
-        print(f"锁信息: {get_lock_info(lock_name)}")
-        print(f"锁状态: {is_locked(lock_name)}")
-        time.sleep(2)
+    if args.acquire:
+        try:
+            with file_lock(args.acquire, timeout=args.timeout):
+                print('LOCK_ACQUIRED')
+                sys.stdout.flush()
+                # 用 sleep loop 保持进程存活，锁不释放
+                # 父进程用 kill 终止时，OS 自动释放 fcntl.flock
+                while True:
+                    time.sleep(1)
+        except TimeoutError:
+            print('LOCK_TIMEOUT')
+            sys.exit(1)
 
-    print(f"释放锁后状态: {is_locked(lock_name)}")
+    elif args.release:
+        # 释放锁：检查并清理锁文件
+        lock_path = os.path.join(LOCK_DIR, f'{args.release}.lock')
+        if os.path.exists(lock_path):
+            if not is_locked(args.release):
+                os.remove(lock_path)
+                print('LOCK_RELEASED')
+            else:
+                print('LOCK_STILL_HELD')
+        else:
+            print('LOCK_NOT_FOUND')
 
-    print("\n锁机制测试完成")
+    elif args.status:
+        locked = is_locked(args.status)
+        info = get_lock_info(args.status)
+        print(f'locked={locked}')
+        if info:
+            print(f'pid={info["pid"]}')
+            print(f'time={info["time"]}')
+
+    else:
+        parser.print_help()
