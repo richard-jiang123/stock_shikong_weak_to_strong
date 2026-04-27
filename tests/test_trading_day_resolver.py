@@ -341,12 +341,55 @@ class TestTradingDayInfo:
         assert info.should_process_critical is False
 
 
+class TestTradingDayResolverDetermineTradingDay:
+    """_determine_trading_day 方法测试"""
+
+    def test_cached_trading_day(self, tmp_db):
+        """缓存中有交易日标记"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        with resolver.dl._get_conn() as conn:
+            conn.execute("INSERT INTO trading_day_cache (date, is_trading_day, checked_at) VALUES ('2026-04-27', 1, datetime('now'))")
+
+        result = resolver._determine_trading_day('2026-04-27')
+        assert result is True
+
+    def test_cached_non_trading_day(self, tmp_db):
+        """缓存中有非交易日标记"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        with resolver.dl._get_conn() as conn:
+            conn.execute("INSERT INTO trading_day_cache (date, is_trading_day, checked_at) VALUES ('2026-04-26', 0, datetime('now'))")
+
+        result = resolver._determine_trading_day('2026-04-26')
+        assert result is False
+
+    def test_saturday_is_non_trading(self, tmp_db):
+        """周六必然是非交易日"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        # 2026-04-25 是周六
+        result = resolver._determine_trading_day('2026-04-25')
+        assert result is False
+
+    def test_sunday_is_non_trading(self, tmp_db):
+        """周日必然是非交易日"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        # 2026-04-26 是周日
+        result = resolver._determine_trading_day('2026-04-26')
+        assert result is False
+
+    def test_weekday_no_cache_assumes_trading(self, tmp_db):
+        """工作日无缓存时默认为交易日"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        # 2026-04-27 是周一，无缓存
+        result = resolver._determine_trading_day('2026-04-27')
+        # 无缓存且非周末 -> 默认 True（后续 resolve 会通过其他逻辑确认）
+        assert result is True
+
+
 class TestTradingDayResolverGetEffectiveDataDate:
     """_get_effective_data_date 方法测试"""
 
     def test_get_from_stock_daily(self, tmp_db):
         """从 stock_daily 获取有效数据日期"""
-        from trading_day_resolver import TradingDayResolver
         resolver = TradingDayResolver(db_path=tmp_db)
         # 插入测试数据
         with resolver.dl._get_conn() as conn:
@@ -357,7 +400,6 @@ class TestTradingDayResolverGetEffectiveDataDate:
 
     def test_empty_database_returns_today(self, tmp_db):
         """空数据库返回今天"""
-        from trading_day_resolver import TradingDayResolver
         resolver = TradingDayResolver(db_path=tmp_db)
         today = datetime.now().strftime('%Y-%m-%d')
         result = resolver._get_effective_data_date(today)
@@ -365,10 +407,43 @@ class TestTradingDayResolverGetEffectiveDataDate:
 
     def test_fallback_to_trading_day_cache(self, tmp_db):
         """从 trading_day_cache 获取最近交易日"""
-        from trading_day_resolver import TradingDayResolver
         resolver = TradingDayResolver(db_path=tmp_db)
         with resolver.dl._get_conn() as conn:
             conn.execute("INSERT INTO trading_day_cache (date, is_trading_day, checked_at) VALUES ('2026-04-24', 1, datetime('now'))")
 
         result = resolver._get_effective_data_date('2026-04-27')
         assert result == '2026-04-24'
+
+
+class TestTradingDayResolverCountTradingDaysGap:
+    """_count_trading_days_gap 方法测试"""
+
+    def test_same_day_returns_zero(self, tmp_db):
+        """同一天返回 0"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        result = resolver._count_trading_days_gap('2026-04-24', '2026-04-24')
+        assert result == 0
+
+    def test_with_trading_day_cache(self, tmp_db):
+        """有缓存时计算交易日间隔"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        with resolver.dl._get_conn() as conn:
+            # 插入连续交易日
+            for d in ['2026-04-24', '2026-04-27', '2026-04-28']:
+                conn.execute("INSERT INTO trading_day_cache (date, is_trading_day, checked_at) VALUES (?, 1, datetime('now'))", (d,))
+            # 插入非交易日
+            for d in ['2026-04-25', '2026-04-26']:
+                conn.execute("INSERT INTO trading_day_cache (date, is_trading_day, checked_at) VALUES (?, 0, datetime('now'))", (d,))
+
+        # 24(周五) 到 28(周二): 查询 > 24 AND <= 28
+        # 范围内: 25(周六x), 26(周日x), 27(周一ok), 28(周二ok) = 2 个交易日
+        result = resolver._count_trading_days_gap('2026-04-24', '2026-04-28')
+        assert result == 2
+
+    def test_no_cache_fallback_to_weekday_count(self, tmp_db):
+        """无缓存时按工作日估算"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        # 2026-04-24(周五) 到 2026-04-28(周二)
+        # 按工作日: 25(周六), 26(周日), 27(周一), 28(周二) -> 2 个工作日
+        result = resolver._count_trading_days_gap('2026-04-24', '2026-04-28')
+        assert result == 2  # 估算值，排除周末
