@@ -59,24 +59,14 @@ class AdaptiveEngine:
             dict: {
                 'alerts': list,
                 'critical_handled': int,
-                'status': 'ok' | 'warning' | 'critical',
+                'status': 'ok' | 'warning' | 'critical' | 'skipped',
             }
         """
-        # 实际运行日期
-        actual_run_date = datetime.now().strftime('%Y-%m-%d')
+        # 使用 resolver 获取统一信息
+        info = self.resolver.resolve(monitor_date)
 
-        if monitor_date is None:
-            monitor_date = actual_run_date
-
-        # 获取最近交易日
-        latest_trade_date = self._get_latest_trade_date()
-
-        # 判断 monitor_date 是否为交易日
-        is_monitor_date_trading = self._is_trading_day(monitor_date)
-
-        # 非交易日运行监控的决策
-        if not is_monitor_date_trading:
-            # 非交易日：只执行回滚监控（基于配置参数），跳过数据监控
+        # 非交易日：跳过数据监控
+        if info.status == STATUS_NON_TRADING_DAY:
             rollback_result = self.change_mgr.monitor_and_rollback()
             if rollback_result['rollback_triggered'] > 0:
                 self._notify_rollback_result(rollback_result)
@@ -85,35 +75,36 @@ class AdaptiveEngine:
                 'critical_handled': 0,
                 'status': 'skipped',
                 'reason': 'non_trading_day',
-                'message': f'{monitor_date} 是非交易日（周末/节假日），跳过数据监控',
+                'message': f'{info.target_date} 是非交易日（周末/节假日），跳过数据监控',
                 'rollback_monitor': rollback_result,
             }
 
-        # 判断是否是"当前监控"（数据日期 >= 最近交易日）
-        # 历史数据回补不应触发参数变更
-        is_current_monitor = (monitor_date >= latest_trade_date)
+        # 数据滞后警告
+        if info.status == STATUS_DATA_NOT_UPDATED and info.data_lag_days > 0:
+            self._log_warning(
+                f"数据滞后 {info.data_lag_days} 天，市场环境判断基于 {info.effective_data_date}"
+            )
 
-        # 防重复检查：基于最近交易日（交易周期内只处理一次）
-        if is_current_monitor:
-            critical_already_handled = self._check_critical_already_handled(latest_trade_date)
-        else:
-            # 历史数据回补：强制跳过 critical 处理
-            critical_already_handled = True
+        # 历史日期：跳过 critical 处理
+        if info.status == STATUS_HISTORICAL:
+            alerts = self.monitor.run(info.target_date)
+            return {
+                'alerts': alerts,
+                'critical_handled': 0,
+                'status': 'ok',
+                'reason': 'historical',
+                'message': f'历史日期 {info.target_date} 运行，跳过 critical 处理',
+            }
 
-        # 执行每日监控（监控本身可以多次执行，数据更新时需要重新计算）
-        alerts = self.monitor.run(monitor_date)
-
-        # 处理 critical 预警（仅在当前监控且首次执行时处理）
+        # 当前监控：使用 effective_data_date 进行数据查询
+        alerts = self.monitor.run(info.effective_data_date)
         critical_alerts = [a for a in alerts if a['severity'] == 'critical']
-        critical_handled = 0
 
-        if not critical_already_handled:
-            for alert in critical_alerts:
-                handled = self._handle_critical_alert(alert, monitor_date)
-                if handled:
-                    critical_handled += 1
-                    # 记录已处理标记（基于最近交易日）
-                    self._mark_critical_handled(latest_trade_date, alert['type'])
+        critical_handled = 0
+        if info.should_process_critical:
+            critical_handled = self._handle_critical_alerts_with_recovery(
+                critical_alerts, info
+            )
 
         # 确定整体状态
         if critical_alerts:
@@ -445,6 +436,25 @@ class AdaptiveEngine:
                         (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
                         VALUES (?, 'critical_action', ?, 'critical', ?, datetime('now'))
                     """, (datetime.now().strftime('%Y-%m-%d'), message, 'notified'))
+
+    def _log_warning(self, message):
+        """记录警告信息"""
+        print(f"\n[WARNING] {message}")
+        with self.dl._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO daily_monitor_log
+                (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
+                VALUES (?, 'data_lag_warning', ?, 'warning', 'logged', datetime('now'))
+            """, (datetime.now().strftime('%Y-%m-%d'), message))
+
+    def _handle_critical_alerts_with_recovery(self, alerts, info):
+        """处理 critical 预警（占位实现）"""
+        # Phase 2 占位：直接调用原有方法，不带恢复机制
+        handled = 0
+        for alert in alerts:
+            if self._handle_critical_alert(alert, info.effective_data_date):
+                handled += 1
+        return handled
 
     def _apply_optimization(self, optimization_detail):
         """应用已验证通过的优化"""
