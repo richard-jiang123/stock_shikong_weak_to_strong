@@ -622,37 +622,6 @@ class AdaptiveEngine:
         # 标记为已应用
         self.sandbox_validator.mark_as_applied(optimize_id)
 
-    def _get_latest_trade_date(self):
-        """
-        获取最近交易日（考虑节假日）
-
-        优先从 stock_daily 获取最新数据日期（隐式排除节假日）
-        如果数据库为空，尝试从 trading_day_cache 获取最近的交易日
-        最后回退到今天（需调用方自行判断是否为交易日）
-
-        Returns:
-            str: 最近交易日日期 (YYYY-MM-DD)
-        """
-        # 方法1: 从实际数据获取（最可靠）
-        with self.dl._get_conn() as conn:
-            row = conn.execute("""
-                SELECT MAX(date) FROM stock_daily
-            """).fetchone()
-            if row and row[0]:
-                return row[0]
-
-            # 方法2: 从交易日缓存获取最近交易日
-            row = conn.execute("""
-                SELECT date FROM trading_day_cache
-                WHERE is_trading_day = 1
-                ORDER BY date DESC LIMIT 1
-            """).fetchone()
-            if row and row[0]:
-                return row[0]
-
-        # 方法3: 回退到今天（调用方需判断是否为交易日）
-        return datetime.now().strftime('%Y-%m-%d')
-
     def _check_optimization_already_run(self, optimize_date):
         """检查今天是否已经执行过每周优化（已完成验证的记录）"""
         with self.dl._get_conn() as conn:
