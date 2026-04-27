@@ -14,7 +14,6 @@ from trading_day_resolver import (
     STATUS_DATA_NOT_UPDATED,
     STATUS_NON_TRADING_DAY,
     STATUS_HISTORICAL,
-    VALID_STATUSES,
 )
 
 
@@ -127,16 +126,16 @@ class TestTradingDayInfo:
 
     def test_should_process_critical_edge_cases(self):
         """测试 should_process_critical 边界情况"""
-        # non_trading_day + is_current_monitor=True -> False
+        # is_current_monitor=False + STATUS_DATA_READY -> False
         info = TradingDayInfo(
-            target_date='2026-04-26',
-            effective_data_date='2026-04-24',
-            is_trading_day=False,
+            target_date='2026-04-27',
+            effective_data_date='2026-04-27',
+            is_trading_day=True,
             data_ready=True,
             data_lag_days=0,
-            status=STATUS_NON_TRADING_DAY,
-            monitor_period_key='2026-04-24',
-            is_current_monitor=True,
+            status=STATUS_DATA_READY,
+            monitor_period_key='2026-04-27',
+            is_current_monitor=False,
         )
         assert info.should_process_critical is False
 
