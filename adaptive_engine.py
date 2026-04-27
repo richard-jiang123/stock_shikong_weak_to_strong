@@ -14,6 +14,13 @@ from daily_monitor import DailyMonitor
 from weekly_optimizer import WeeklyOptimizer
 from sandbox_validator import SandboxValidator
 from change_manager import ChangeManager
+from trading_day_resolver import (
+    TradingDayResolver,
+    STATUS_DATA_READY,
+    STATUS_DATA_NOT_UPDATED,
+    STATUS_NON_TRADING_DAY,
+    STATUS_HISTORICAL,
+)
 
 
 class AdaptiveEngine:
@@ -39,6 +46,7 @@ class AdaptiveEngine:
         self.weekly_optimizer = WeeklyOptimizer(db_path)
         self.sandbox_validator = SandboxValidator(db_path)
         self.change_mgr = ChangeManager(db_path)
+        self.resolver = TradingDayResolver(db_path)
 
     def run_daily(self, monitor_date=None):
         """
