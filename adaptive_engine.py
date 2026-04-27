@@ -405,16 +405,6 @@ class AdaptiveEngine:
                 VALUES (?, ?, ?, ?, 'logged', datetime('now'))
             """, (monitor_date, alert['type'], alert['detail'], 'critical'))
 
-    def _check_critical_already_handled(self, monitor_date):
-        """检查今天是否已经处理过 critical 预警"""
-        with self.dl._get_conn() as conn:
-            # 检查今天是否有 action_taken='handled' 的记录
-            count = conn.execute("""
-                SELECT COUNT(*) FROM daily_monitor_log
-                WHERE monitor_date=? AND action_taken='handled'
-            """, (monitor_date,)).fetchone()[0]
-        return count > 0
-
     def _mark_critical_handled(self, monitor_date, alert_type):
         """标记今天已处理某个类型的 critical 预警"""
         with self.dl._get_conn() as conn:
@@ -522,25 +512,6 @@ class AdaptiveEngine:
 
         # 方法3: 回退到今天（调用方需判断是否为交易日）
         return datetime.now().strftime('%Y-%m-%d')
-
-    def _is_trading_day(self, date_str):
-        """
-        判断是否为交易日（考虑节假日）
-
-        Returns:
-            bool: True=交易日, False=非交易日(周末/节假日)
-        """
-        # 先检查缓存
-        with self.dl._get_conn() as conn:
-            row = conn.execute("""
-                SELECT is_trading_day FROM trading_day_cache WHERE date=?
-            """, (date_str,)).fetchone()
-            if row is not None:
-                return row[0] == 1
-
-        # 无缓存时简单判断周末（节假日需要实际数据或 API）
-        dt = datetime.strptime(date_str, '%Y-%m-%d')
-        return dt.weekday() < 5  # 周一至周五
 
     def _check_optimization_already_run(self, optimize_date):
         """检查今天是否已经执行过每周优化（已完成验证的记录）"""
