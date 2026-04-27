@@ -65,39 +65,39 @@ class DailyMonitor:
             self.dl = StockDataLayer(db_path)
         self.cfg = StrategyConfig(db_path)
 
-    def run(self, monitor_date=None):
+    def run(self, effective_date=None):
         """
         运行每日监控
 
         Args:
-            monitor_date: 监控日期，默认今天
+            effective_date: 有效数据日期（由 resolver 提供）
 
         Returns:
             alerts: 预警列表
         """
-        if monitor_date is None:
-            monitor_date = datetime.now().strftime('%Y-%m-%d')
+        if effective_date is None:
+            effective_date = datetime.now().strftime('%Y-%m-%d')
 
         alerts = []
 
         # 1. 检查信号期望值
-        signal_alerts = self._check_signal_expectancy(monitor_date)
+        signal_alerts = self._check_signal_expectancy(effective_date)
         alerts.extend(signal_alerts)
 
-        # 2. 检查市场环境
-        regime_alert = self._check_market_regime(monitor_date)
+        # 2. 检查市场环境（使用 effective_date）
+        regime_alert = self._check_market_regime(effective_date)
         if regime_alert:
             alerts.append(regime_alert)
 
         # 3. 更新 signal_status 表
         self._update_signal_status()
 
-        # 4. 写入监控日志
-        self._write_monitor_log(alerts, monitor_date)
+        # 4. 写入监控日志（使用 effective_date）
+        self._write_monitor_log(alerts, effective_date)
 
         return alerts
 
-    def _check_signal_expectancy(self, monitor_date):
+    def _check_signal_expectancy(self, effective_date):
         """检查各信号期望值"""
         alerts = []
 
@@ -135,12 +135,12 @@ class DailyMonitor:
 
         return alerts
 
-    def _check_market_regime(self, monitor_date):
+    def _check_market_regime(self, effective_date):
         """检查市场环境"""
-        # 获取上证指数数据（使用 get_index_kline 查询 index_daily 表）
+        # 使用 effective_date 作为查询截止日期
         index_data = self.dl.get_index_kline('sh.000001',
             start_date=(datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
-            end_date=monitor_date
+            end_date=effective_date  # 改动：使用有效数据日期
         )
 
         if index_data is None or len(index_data) < 20:
@@ -149,7 +149,7 @@ class DailyMonitor:
         regime, coeff, consecutive = self._get_market_regime_smoothed(index_data)
 
         # 更新 market_regime 表（传递 index_data 避免重复查询）
-        self._update_market_regime_table(monitor_date, regime, coeff, consecutive, index_data)
+        self._update_market_regime_table(effective_date, regime, coeff, consecutive, index_data)
 
         if regime == 'bear' and consecutive >= 5:
             return {
@@ -280,14 +280,14 @@ class DailyMonitor:
                     WHERE signal_type=?
                 """, (win_rate, avg_win, avg_loss, expectancy, expectancy_lb, len(pnls), signal_type))
 
-    def _write_monitor_log(self, alerts, monitor_date):
+    def _write_monitor_log(self, alerts, effective_date):
         """写入监控日志（每天只记录一次）"""
         with self.dl._get_conn() as conn:
             # 检查今天是否已有日志记录
             existing_count = conn.execute("""
                 SELECT COUNT(*) FROM daily_monitor_log
                 WHERE monitor_date=? AND action_taken='logged'
-            """, (monitor_date,)).fetchone()[0]
+            """, (effective_date,)).fetchone()[0]
 
             if existing_count > 0:
                 # 今天已有记录，不再追加
@@ -298,7 +298,7 @@ class DailyMonitor:
                     INSERT OR IGNORE INTO daily_monitor_log
                     (monitor_date, alert_type, alert_detail, severity, action_taken)
                     VALUES (?, ?, ?, ?, 'logged')
-                """, (monitor_date, alert['type'], alert['detail'], alert['severity']))
+                """, (effective_date, alert['type'], alert['detail'], alert['severity']))
 
     def print_summary(self, alerts, monitor_date=None):
         """打印监控摘要"""
