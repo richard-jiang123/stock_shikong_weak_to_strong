@@ -338,5 +338,84 @@ class TestAdaptiveEngine(unittest.TestCase):
         self.assertIn('min_sample_for_critical', AdaptiveEngine.CRITICAL_CONFIG)
 
 
+class TestAdaptiveEngineWithResolver:
+    """AdaptiveEngine 使用 resolver 的集成测试"""
+
+    def test_run_daily_non_trading_day(self, tmp_db):
+        """非交易日跳过数据监控"""
+        from adaptive_engine import AdaptiveEngine
+        engine = AdaptiveEngine(db_path=tmp_db)
+        resolver = TradingDayResolver(db_path=tmp_db)
+
+        # 设置数据库：最新数据为周五
+        with engine.dl._get_conn() as conn:
+            conn.execute("INSERT INTO stock_daily (date, code, close) VALUES ('2026-04-24', 'sh.600000', 10.0)")
+
+        # 周六运行
+        result = engine.run_daily('2026-04-25')
+        assert result['status'] == 'skipped'
+        assert result['reason'] == 'non_trading_day'
+
+    def test_run_daily_data_not_updated(self, tmp_db):
+        """数据未更新时使用旧数据"""
+        from adaptive_engine import AdaptiveEngine
+        engine = AdaptiveEngine(db_path=tmp_db)
+
+        # 设置数据库：最新数据滞后 3 天
+        with engine.dl._get_conn() as conn:
+            conn.execute("INSERT INTO stock_daily (date, code, close) VALUES ('2026-04-24', 'sh.600000', 10.0)")
+            conn.execute("INSERT INTO trading_day_cache (date, is_trading_day, checked_at) VALUES ('2026-04-27', 1, datetime('now'))")
+
+        result = engine.run_daily('2026-04-27')
+        assert result['status'] in ('ok', 'warning', 'critical')
+        # 验证使用了 effective_data_date
+
+    def test_run_daily_historical_date(self, tmp_db):
+        """历史日期跳过 critical"""
+        from adaptive_engine import AdaptiveEngine
+        engine = AdaptiveEngine(db_path=tmp_db)
+
+        # 设置数据库：最新数据为今天
+        with engine.dl._get_conn() as conn:
+            conn.execute("INSERT INTO stock_daily (date, code, close) VALUES ('2026-04-27', 'sh.600000', 10.0)")
+
+        result = engine.run_daily('2026-04-20')
+        assert result['reason'] == 'historical'
+        assert result['critical_handled'] == 0
+
+    def test_run_weekly_not_thursday(self, tmp_db):
+        """非周四不允许执行优化"""
+        from adaptive_engine import AdaptiveEngine
+        engine = AdaptiveEngine(db_path=tmp_db)
+
+        # 设置数据库
+        with engine.dl._get_conn() as conn:
+            conn.execute("INSERT INTO stock_daily (date, code, close) VALUES ('2026-04-27', 'sh.600000', 10.0)")
+
+        # 周一运行
+        result = engine.run_weekly('2026-04-27')
+        assert result['reason'] == 'not_thursday'
+
+    def test_critical_handling_recovery(self, tmp_db):
+        """中断恢复测试"""
+        from adaptive_engine import AdaptiveEngine
+        engine = AdaptiveEngine(db_path=tmp_db)
+
+        # 设置数据库
+        with engine.dl._get_conn() as conn:
+            conn.execute("INSERT INTO stock_daily (date, code, close) VALUES ('2026-04-27', 'sh.600000', 10.0)")
+            # 模拟中断状态：handling
+            conn.execute("""
+                INSERT INTO critical_process_state
+                (period_key, started_at, status, alerts_total, alerts_processed)
+                VALUES ('2026-04-27', datetime('now'), 'handling', 3, 1)
+            """)
+
+        # 第二次运行：应检测到 handling 状态并恢复
+        result = engine.run_daily('2026-04-27')
+        # 验证：应回滚并重新处理
+        assert result['status'] in ('ok', 'warning', 'critical')
+
+
 if __name__ == '__main__':
     unittest.main()

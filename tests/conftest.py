@@ -100,6 +100,14 @@ def tmp_db():
             optimize_type TEXT NOT NULL,
             status TEXT DEFAULT 'staged',
             staged_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            validation_started_at TEXT,
+            validated_at TEXT,
+            applied_at TEXT,
+            rejected_at TEXT,
+            rejection_reason TEXT,
+            rollback_triggered INTEGER DEFAULT 0,
+            rollback_at TEXT,
+            rollback_reason TEXT,
             UNIQUE(param_key, batch_id)
         )
     """)
@@ -152,13 +160,20 @@ def tmp_db():
     conn.execute("""
         CREATE TABLE IF NOT EXISTS param_snapshot (
             id INTEGER PRIMARY KEY,
-            snapshot_type TEXT NOT NULL,
-            snapshot_data TEXT NOT NULL,
+            snapshot_date TEXT NOT NULL,
+            snapshot_type TEXT,
             batch_id TEXT,
             trigger_reason TEXT,
+            params_json TEXT,
+            signal_status_json TEXT,
+            environment_json TEXT,
+            is_restored INTEGER DEFAULT 0,
+            restored_at TEXT,
+            restore_reason TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_date ON param_snapshot(snapshot_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_batch ON param_snapshot(batch_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_type ON param_snapshot(snapshot_type)")
 
