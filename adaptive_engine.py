@@ -154,35 +154,43 @@ class AdaptiveEngine:
         if optimize_date is None:
             optimize_date = datetime.now().strftime('%Y-%m-%d')
 
-        # 获取最近交易日
-        latest_trade_date = self._get_latest_trade_date()
+        # 使用 resolver 获取统一信息
+        info = self.resolver.resolve(optimize_date)
 
-        # 判断是否是"当前优化"（数据日期 >= 最近交易日）
-        # 历史数据回补不应触发参数变更
-        is_current_optimize = (optimize_date >= latest_trade_date)
-
-        if not is_current_optimize:
+        # 历史日期：不允许执行
+        if info.status == STATUS_HISTORICAL:
             return {
                 'optimization_results': None,
                 'sandbox_validation': None,
                 'applied': 0,
                 'rejected': 0,
-                'reason': 'historical_date_not_allowed',
+                'reason': 'historical_not_allowed',
                 'message': '历史日期不允许执行每周优化（会修改当前生产参数）',
             }
 
-        # 判断本周周四是否是有效优化日（基于最近交易日所在周）
-        latest_dt = datetime.strptime(latest_trade_date, '%Y-%m-%d')
-        # 找到本周周四（weekday: 周一=0, 周四=3）
-        days_to_thursday = (3 - latest_dt.weekday()) % 7
-        this_week_thursday = (latest_dt + timedelta(days=days_to_thursday)).strftime('%Y-%m-%d')
+        # 非交易日：不允许执行
+        if info.status == STATUS_NON_TRADING_DAY:
+            return {
+                'optimization_results': None,
+                'sandbox_validation': None,
+                'applied': 0,
+                'rejected': 0,
+                'reason': 'non_trading_day',
+                'message': '非交易日不允许执行每周优化',
+            }
 
-        # 如果今天是周四，或者本周周四已过，检查本周周四是否已执行
-        current_dt = datetime.strptime(optimize_date, '%Y-%m-%d')
-        is_thursday = current_dt.weekday() == 3
+        # 周四判断：基于 effective_data_date 所在周
+        effective_dt = datetime.strptime(info.effective_data_date, '%Y-%m-%d')
+        days_to_thursday = (3 - effective_dt.weekday()) % 7
+        this_week_thursday_dt = effective_dt + timedelta(days=days_to_thursday)
+        this_week_thursday = this_week_thursday_dt.strftime('%Y-%m-%d')
+
+        # 判断今天是周四（基于 target_date）
+        target_dt = datetime.strptime(info.target_date, '%Y-%m-%d')
+        is_thursday = target_dt.weekday() == 3
 
         # 非周四不允许执行（除非本周周四已过且未执行）
-        if not is_thursday and current_dt < datetime.strptime(this_week_thursday, '%Y-%m-%d'):
+        if not is_thursday and target_dt < this_week_thursday_dt:
             return {
                 'optimization_results': None,
                 'sandbox_validation': None,
@@ -191,8 +199,8 @@ class AdaptiveEngine:
                 'reason': 'not_thursday',
             }
 
-        # 检查本周周四是否已经执行过优化（基于本周周四日期）
-        check_date = this_week_thursday if not is_thursday else optimize_date
+        # 防重复检查：基于本周周四日期
+        check_date = this_week_thursday if not is_thursday else info.target_date
         if self._check_optimization_already_run(check_date):
             return {
                 'optimization_results': None,
@@ -202,7 +210,7 @@ class AdaptiveEngine:
                 'reason': 'already_run_this_week',
             }
 
-        # 检查本周是否已经有新创建的 pending 记录
+        # 检查是否有 pending 记录
         if self._check_has_today_pending(check_date):
             return {
                 'optimization_results': None,
@@ -211,6 +219,9 @@ class AdaptiveEngine:
                 'rejected': 0,
                 'reason': 'pending_validation_in_progress',
             }
+
+        # === guard 子句结束 ===
+        # 以下原有代码保留不变（继续执行优化流程）
 
         # 1. 执行四层优化（变更暂存到 sandbox_config）
         optimization_results = self.weekly_optimizer.run(optimize_date, layers)
