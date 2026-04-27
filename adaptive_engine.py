@@ -405,15 +405,6 @@ class AdaptiveEngine:
                 VALUES (?, ?, ?, ?, 'logged', datetime('now'))
             """, (monitor_date, alert['type'], alert['detail'], 'critical'))
 
-    def _mark_critical_handled(self, monitor_date, alert_type):
-        """标记今天已处理某个类型的 critical 预警"""
-        with self.dl._get_conn() as conn:
-            conn.execute("""
-                INSERT OR IGNORE INTO daily_monitor_log
-                (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
-                VALUES (?, ?, '', 'critical', 'handled', datetime('now'))
-            """, (monitor_date, alert_type))
-
     def _notify_critical(self, message):
         """发送 critical 通知"""
         for method in self.CRITICAL_CONFIG['notification_methods']:
@@ -438,13 +429,151 @@ class AdaptiveEngine:
             """, (datetime.now().strftime('%Y-%m-%d'), message))
 
     def _handle_critical_alerts_with_recovery(self, alerts, info):
-        """处理 critical 预警（占位实现）"""
-        # Phase 2 占位：直接调用原有方法，不带恢复机制
-        handled = 0
-        for alert in alerts:
-            if self._handle_critical_alert(alert, info.effective_data_date):
-                handled += 1
-        return handled
+        """
+        处理 critical 预警（带中断恢复）
+
+        Args:
+            alerts: critical 预警列表
+            info: TradingDayInfo 对象
+
+        Returns:
+            int: 处理的预警数量
+        """
+        from process_lock import file_lock
+
+        period_key = info.monitor_period_key
+
+        if not alerts:
+            return 0
+
+        # 1. 获取文件锁
+        try:
+            with file_lock(f'critical_{period_key}', timeout=300):
+                # 2. 检查是否有未完成的处理（中断恢复）
+                pending_state = self._get_critical_state(period_key)
+                if pending_state:
+                    if pending_state['status'] in ('handling', 'failed'):
+                        # 有未完成的处理或失败的处理 -> 回滚并重新开始
+                        self._rollback_incomplete_changes(pending_state['id'])
+                        self._clear_critical_state(pending_state['id'])
+                    elif pending_state['status'] == 'handled':
+                        # 已完成 -> 跳过
+                        return 0
+
+                # 3. 标记开始处理
+                record_id = self._mark_critical_handling(period_key, alerts_total=len(alerts))
+
+                # 4. 处理各 alert
+                handled = 0
+                try:
+                    for alert in alerts:
+                        self._handle_critical_alert(alert, info.effective_data_date)
+                        handled += 1
+                        self._update_critical_progress(record_id, handled)
+
+                    # 5. 处理完成
+                    self._mark_critical_handled(record_id)
+
+                except Exception as e:
+                    # 6. 中断时标记为 failed
+                    self._mark_critical_failed(record_id, str(e))
+                    raise
+
+                return handled
+
+        except TimeoutError:
+            # 锁获取超时，说明其他进程正在处理
+            print(f"[INFO] 其他进程正在处理 critical ({period_key})")
+            return 0
+
+    def _get_critical_state(self, period_key):
+        """获取 critical 处理状态"""
+        with self.dl._get_conn() as conn:
+            # 优先查询已完成的记录
+            row = conn.execute("""
+                SELECT id, status, alerts_processed, changes_applied
+                FROM critical_process_state
+                WHERE period_key=? AND status='handled'
+                ORDER BY completed_at DESC LIMIT 1
+            """, (period_key,)).fetchone()
+            if row:
+                return {'id': row[0], 'status': row[1], 'alerts_processed': row[2], 'changes_applied': row[3]}
+
+            # 查询正在处理的记录
+            row = conn.execute("""
+                SELECT id, status, alerts_processed, changes_applied
+                FROM critical_process_state
+                WHERE period_key=? AND status IN ('handling', 'failed')
+                ORDER BY started_at DESC LIMIT 1
+            """, (period_key,)).fetchone()
+            if row:
+                return {'id': row[0], 'status': row[1], 'alerts_processed': row[2], 'changes_applied': row[3]}
+            return None
+
+    def _mark_critical_handling(self, period_key, alerts_total) -> int:
+        """标记开始处理，返回记录 id"""
+        with self.dl._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO critical_process_state
+                (period_key, started_at, status, alerts_total)
+                VALUES (?, datetime('now'), 'handling', ?)
+            """, (period_key, alerts_total))
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def _update_critical_progress(self, record_id, alerts_processed):
+        """更新处理进度"""
+        with self.dl._get_conn() as conn:
+            conn.execute("""
+                UPDATE critical_process_state
+                SET alerts_processed=? WHERE id=?
+            """, (alerts_processed, record_id))
+
+    def _mark_critical_handled(self, record_id):
+        """标记处理完成"""
+        with self.dl._get_conn() as conn:
+            conn.execute("""
+                UPDATE critical_process_state
+                SET status='handled', completed_at=datetime('now')
+                WHERE id=?
+            """, (record_id,))
+
+    def _mark_critical_failed(self, record_id, error_detail):
+        """标记处理失败"""
+        with self.dl._get_conn() as conn:
+            conn.execute("""
+                UPDATE critical_process_state
+                SET status='failed', error_detail=?, completed_at=datetime('now')
+                WHERE id=?
+            """, (error_detail, record_id))
+
+    def _clear_critical_state(self, record_id):
+        """清除处理状态记录"""
+        with self.dl._get_conn() as conn:
+            conn.execute("DELETE FROM critical_process_state WHERE id=?", (record_id,))
+
+    def _rollback_incomplete_changes(self, record_id):
+        """回滚未完成的变更"""
+        # critical batch_id 格式: {YYYYMMDD}-crit（无横杠）
+        # period_key 格式: YYYY-MM-DD（有横杠）
+        # 需要转换格式后精确匹配
+        with self.dl._get_conn() as conn:
+            row = conn.execute("""
+                SELECT period_key FROM critical_process_state WHERE id=?
+            """, (record_id,)).fetchone()
+            if not row:
+                return
+
+            period_key = row[0]
+            # 转换格式: "2026-04-27" -> "20260427-crit"
+            batch_id = period_key.replace('-', '') + '-crit'
+
+            # 精确匹配 batch_id
+            rows = conn.execute("""
+                SELECT id FROM sandbox_config
+                WHERE batch_id=? AND status='pending'
+            """, (batch_id,)).fetchall()
+            for row in rows:
+                self.change_mgr.rollback_change(row[0])
 
     def _apply_optimization(self, optimization_detail):
         """应用已验证通过的优化"""
