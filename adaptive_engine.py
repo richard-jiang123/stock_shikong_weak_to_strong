@@ -82,6 +82,7 @@ class AdaptiveEngine:
         # 数据滞后警告
         if info.status == STATUS_DATA_NOT_UPDATED and info.data_lag_days > 0:
             self._log_warning(
+                info.effective_data_date,
                 f"数据滞后 {info.data_lag_days} 天，市场环境判断基于 {info.effective_data_date}"
             )
 
@@ -429,15 +430,20 @@ class AdaptiveEngine:
                         VALUES (?, 'critical_action', ?, 'critical', ?, datetime('now'))
                     """, (datetime.now().strftime('%Y-%m-%d'), message, 'notified'))
 
-    def _log_warning(self, message):
-        """记录警告信息"""
+    def _log_warning(self, effective_date, message):
+        """记录警告信息
+
+        Args:
+            effective_date: 有效数据日期
+            message: 警告信息
+        """
         print(f"\n[WARNING] {message}")
         with self.dl._get_conn() as conn:
             conn.execute("""
-                INSERT INTO daily_monitor_log
+                INSERT OR IGNORE INTO daily_monitor_log
                 (monitor_date, alert_type, alert_detail, severity, action_taken, created_at)
                 VALUES (?, 'data_lag_warning', ?, 'warning', 'logged', datetime('now'))
-            """, (datetime.now().strftime('%Y-%m-%d'), message))
+            """, (effective_date, message))
 
     def _handle_critical_alerts_with_recovery(self, alerts, info):
         """
