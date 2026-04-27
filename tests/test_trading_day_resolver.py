@@ -447,3 +447,86 @@ class TestTradingDayResolverCountTradingDaysGap:
         # 按工作日: 25(周六), 26(周日), 27(周一), 28(周二) -> 2 个工作日
         result = resolver._count_trading_days_gap('2026-04-24', '2026-04-28')
         assert result == 2  # 估算值，排除周末
+
+
+class TestTradingDayResolverResolve:
+    """resolve() 方法测试"""
+
+    def test_data_ready(self, tmp_db):
+        """交易日数据已更新"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        with resolver.dl._get_conn() as conn:
+            conn.execute("INSERT INTO stock_daily (date, code, close) VALUES ('2026-04-27', 'sh.600000', 10.0)")
+            conn.execute("INSERT INTO trading_day_cache (date, is_trading_day, checked_at) VALUES ('2026-04-27', 1, datetime('now'))")
+
+        info = resolver.resolve('2026-04-27')
+        assert info.status == STATUS_DATA_READY
+        assert info.data_lag_days == 0
+        assert info.monitor_period_key == '2026-04-27'
+        assert info.should_process_critical is True
+
+    def test_data_not_updated(self, tmp_db):
+        """交易日数据未更新"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        with resolver.dl._get_conn() as conn:
+            conn.execute("INSERT INTO stock_daily (date, code, close) VALUES ('2026-04-24', 'sh.600000', 10.0)")
+            conn.execute("INSERT INTO trading_day_cache (date, is_trading_day, checked_at) VALUES ('2026-04-27', 1, datetime('now'))")
+
+        info = resolver.resolve('2026-04-27')
+        assert info.status == STATUS_DATA_NOT_UPDATED
+        assert info.effective_data_date == '2026-04-24'
+        assert info.data_lag_days >= 1  # 24(周五) 到 27(周一): 至少1个交易日
+        assert info.monitor_period_key == '2026-04-24'
+        assert info.should_process_critical is True
+
+    def test_non_trading_day_weekend(self, tmp_db):
+        """周末是非交易日"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        with resolver.dl._get_conn() as conn:
+            conn.execute("INSERT INTO stock_daily (date, code, close) VALUES ('2026-04-24', 'sh.600000', 10.0)")
+
+        # 2026-04-25 是周六
+        info = resolver.resolve('2026-04-25')
+        assert info.status == STATUS_NON_TRADING_DAY
+        assert info.is_non_trading_day is True
+        assert info.monitor_period_key == '2026-04-24'
+        assert info.should_process_critical is False
+
+    def test_historical_date(self, tmp_db):
+        """历史日期运行"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        with resolver.dl._get_conn() as conn:
+            conn.execute("INSERT INTO stock_daily (date, code, close) VALUES ('2026-04-24', 'sh.600000', 10.0)")
+
+        info = resolver.resolve('2026-04-20')
+        assert info.status == STATUS_HISTORICAL
+        assert info.is_current_monitor is False
+        assert info.should_process_critical is False
+
+    def test_empty_database(self, tmp_db):
+        """空数据库首次运行"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        today = datetime.now().strftime('%Y-%m-%d')
+        info = resolver.resolve(today)
+        assert info.status == STATUS_DATA_READY
+        assert info.effective_data_date == today
+        assert info.data_lag_days == 0
+
+    def test_future_date_raises_error(self, tmp_db):
+        """未来日期抛出错误"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        with pytest.raises(ValueError, match="Future date not allowed"):
+            resolver.resolve('2030-01-01')
+
+    def test_invalid_format_raises_error(self, tmp_db):
+        """无效日期格式抛出错误"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        with pytest.raises(ValueError, match="Invalid date format"):
+            resolver.resolve('2026-04-27-')
+
+    def test_default_target_date_is_today(self, tmp_db):
+        """默认 target_date 是今天"""
+        resolver = TradingDayResolver(db_path=tmp_db)
+        today = datetime.now().strftime('%Y-%m-%d')
+        info = resolver.resolve()
+        assert info.target_date == today

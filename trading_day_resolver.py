@@ -105,8 +105,67 @@ class TradingDayResolver:
         Returns:
             TradingDayInfo: 包含所有判断所需信息
         """
-        # Phase 1 先返回空实现，后续 Task 完善
-        raise NotImplementedError("resolve() will be implemented in Task 5")
+        # 1. 参数处理与格式验证
+        if target_date is None:
+            target_date = datetime.now().strftime('%Y-%m-%d')
+
+        # 格式验证：确保日期格式正确
+        try:
+            datetime.strptime(target_date, '%Y-%m-%d')
+        except ValueError:
+            raise ValueError(f"Invalid date format: {target_date}, expected YYYY-MM-DD")
+
+        # 边界检查：未来日期不允许
+        today = datetime.now().strftime('%Y-%m-%d')
+        if target_date > today:
+            raise ValueError(f"Future date not allowed: {target_date}")
+
+        # 2. 获取有效数据日期
+        # _get_effective_data_date 永远返回字符串（最坏情况回退到今天），不会返回 None
+        effective_data_date = self._get_effective_data_date(target_date)
+
+        # 3. 判断是否是交易日
+        is_trading_day = self._determine_trading_day(target_date)
+
+        # 4. 判断是否是历史运行（使用 datetime 对象比较）
+        target_dt = datetime.strptime(target_date, '%Y-%m-%d')
+        effective_dt = datetime.strptime(effective_data_date, '%Y-%m-%d')
+        is_current_monitor = target_dt >= effective_dt
+
+        # 5. 确定状态
+        if not is_trading_day:
+            status = STATUS_NON_TRADING_DAY
+            data_ready = True
+            data_lag_days = 0
+        elif not is_current_monitor:
+            status = STATUS_HISTORICAL
+            data_ready = True
+            data_lag_days = 0
+        elif target_date == effective_data_date:
+            status = STATUS_DATA_READY
+            data_ready = True
+            data_lag_days = 0
+        else:
+            status = STATUS_DATA_NOT_UPDATED
+            data_ready = False
+            data_lag_days = self._count_trading_days_gap(effective_data_date, target_date)
+
+        # 6. 计算 monitor_period_key
+        if status in (STATUS_NON_TRADING_DAY, STATUS_DATA_NOT_UPDATED):
+            monitor_period_key = effective_data_date
+        else:
+            monitor_period_key = target_date
+
+        return TradingDayInfo(
+            target_date=target_date,
+            effective_data_date=effective_data_date,
+            is_trading_day=is_trading_day,
+            data_ready=data_ready,
+            data_lag_days=data_lag_days,
+            status=status,
+            monitor_period_key=monitor_period_key,
+            is_current_monitor=is_current_monitor,
+        )
 
     def _get_effective_data_date(self, target_date) -> str:
         """
