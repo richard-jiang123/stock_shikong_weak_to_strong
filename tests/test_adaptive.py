@@ -3,6 +3,7 @@
 import unittest
 import sys
 import os
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -11,6 +12,14 @@ from signal_constants import (
     normalize_signal_type,
     get_display_name,
     get_weight_multiplier,
+)
+from trading_day_resolver import (
+    TradingDayResolver,
+    TradingDayInfo,
+    STATUS_DATA_READY,
+    STATUS_DATA_NOT_UPDATED,
+    STATUS_NON_TRADING_DAY,
+    STATUS_HISTORICAL,
 )
 
 
