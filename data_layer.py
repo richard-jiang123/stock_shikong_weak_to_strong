@@ -212,6 +212,24 @@ class StockDataLayer:
                 )
             """)
 
+            # critical_process_state 表：记录 critical 处理状态，用于恢复机制
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS critical_process_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    period_key TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'handling',
+                    alerts_total INTEGER DEFAULT 0,
+                    alerts_processed INTEGER DEFAULT 0,
+                    changes_applied INTEGER DEFAULT 0,
+                    error_detail TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_critical_period_status ON critical_process_state(period_key, status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_critical_status ON critical_process_state(status)")
+
             # 初始化四种信号的默认状态
             from signal_constants import SIGNAL_TYPE_MAPPING
             for signal_type, display_name in SIGNAL_TYPE_MAPPING.items():
